@@ -19,7 +19,7 @@ import java.util.Collections;
 import java.util.Date;
 import java.util.Map;
 import java.util.SortedMap;
-import java.util.TreeMap;
+import java.util.concurrent.ConcurrentSkipListMap;
 
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
@@ -101,7 +101,7 @@ public class TahuClient implements MqttCallbackExtended {
 	/**
 	 * A list of topics the client has subscribed on
 	 */
-	private SortedMap<String, Integer> subscriptions = new TreeMap<>();
+	private final SortedMap<String, Integer> subscriptions = new ConcurrentSkipListMap<>();
 
 	/*
 	 * Odds/ends
@@ -1390,7 +1390,7 @@ public class TahuClient implements MqttCallbackExtended {
 					if (useSparkplugStatePayload) {
 						try {
 							ObjectMapper mapper = new ObjectMapper();
-							StatePayload statePayload = new StatePayload(false, new Date().getTime());
+							StatePayload statePayload = new StatePayload(false, lastStateDeathPayloadTimestamp);
 							byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
 							lwtDeliveryToken = publish(lwtTopic, payload, lwtQoS, lwtRetain);
 						} catch (Exception e) {
