@@ -30,7 +30,7 @@
 
   <groupId>org.eclipse.tahu</groupId>
   <artifactId>tahu-examples</artifactId>
-  <version>1.0.15-SNAPSHOT</version>
+  <version>1.0.15</version>
   <packaging>pom</packaging>
 
   <name>Eclipse Tahu</name>
