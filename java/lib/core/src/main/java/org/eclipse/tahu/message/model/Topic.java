@@ -220,7 +220,8 @@ public class Topic {
 				if (SparkplugMeta.SPARKPLUG_B_TOPIC_PREFIX.equals(splitTopic[0]) && (messageType == MessageType.DBIRTH
 						|| messageType == MessageType.DCMD || messageType == MessageType.DDATA
 						|| messageType == MessageType.DDEATH || messageType == MessageType.DRECORD)) {
-					return new Topic(SparkplugMeta.SPARKPLUG_B_TOPIC_PREFIX, splitTopic[1], splitTopic[3], messageType);
+					return new Topic(SparkplugMeta.SPARKPLUG_B_TOPIC_PREFIX, splitTopic[1], splitTopic[3],
+							splitTopic[4], messageType);
 				} else {
 					throw new TahuException(TahuErrorCode.INVALID_ARGUMENT,
 							"Invalid Sparkplug Device topic String: ''" + topicString);
