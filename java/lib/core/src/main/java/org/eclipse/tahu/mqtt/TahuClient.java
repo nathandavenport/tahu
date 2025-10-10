@@ -500,6 +500,10 @@ public class TahuClient implements MqttCallbackExtended {
 				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
 						"MQTT client: " + clientId.getMqttClientId() + " is not connected");
 			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			logger.warn("Interrupted while trying to publish on {}", topic);
+			return null;
 		} catch (Exception e) {
 			throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
 		}
@@ -829,6 +833,7 @@ public class TahuClient implements MqttCallbackExtended {
 				try {
 					Thread.sleep(randomDelay);
 				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
 					logger.warn("{}: Sleep interrupted", getClientId(), e);
 				}
 			}
@@ -992,6 +997,7 @@ public class TahuClient implements MqttCallbackExtended {
 								// Sleep for the connect retry interval
 								Thread.sleep(getConnectRetryInterval());
 							} catch (InterruptedException ie) {
+								Thread.currentThread().interrupt();
 								logger.info("{}: Connect thread {} interrupted - giving up",
 										Thread.currentThread().getName(), getClientId());
 								return;
@@ -1028,6 +1034,7 @@ public class TahuClient implements MqttCallbackExtended {
 								Thread.currentThread().getName());
 						state.setInProgress(false);
 					} catch (InterruptedException ie) {
+						Thread.currentThread().interrupt();
 						logger.info("{}: Connect thread 2 interrupted - giving up", getClientId());
 						state.setInProgress(false);
 						return;
@@ -1079,6 +1086,7 @@ public class TahuClient implements MqttCallbackExtended {
 				Thread.sleep(getConnectRetryInterval());
 			}
 		} catch (InterruptedException ie) {
+			Thread.currentThread().interrupt();
 			logger.warn("{}: InterruptedException while preparing to reconnect", getClientId(), ie);
 			return;
 		}
@@ -1248,6 +1256,7 @@ public class TahuClient implements MqttCallbackExtended {
 					try {
 						Thread.sleep(DEFAULT_CONNECT_MONITOR_INTERVAL);
 					} catch (InterruptedException ie) {
+						Thread.currentThread().interrupt();
 						logger.debug("{}: ConnectionMonitor interrupted", monitoredClientId);
 					}
 				}
@@ -1461,6 +1470,7 @@ public class TahuClient implements MqttCallbackExtended {
 			if (lwtTopic != null && clientConnected) {
 				logger.info("{}: Publishing LWT on {} with qos={} and retain={}", getClientId(), lwtTopic, lwtQoS,
 						lwtRetain);
+				boolean lwtPublished = false;
 				synchronized (lwtDeliveryLock) {
 					/*
 					 * Synchronization with the deliveryComplete() callback is needed to ensure that
@@ -1479,11 +1489,16 @@ public class TahuClient implements MqttCallbackExtended {
 					} else {
 						lwtDeliveryToken = publish(lwtTopic, lwtPayload, lwtQoS, lwtRetain);
 					}
-					logger.debug("{}: published on LWT Topic={}, messageId={}", getClientId(), lwtTopic,
-							lwtDeliveryToken.getMessageId());
+					if (lwtDeliveryToken != null) {
+						logger.debug("{}: published on LWT Topic={}, messageId={}", getClientId(), lwtTopic,
+								lwtDeliveryToken.getMessageId());
+						lwtPublished = true;
+					} else {
+						logger.warn("Failed to publish LWT {}", lwtTopic);
+					}
 				}
 
-				if (waitForLwt) {
+				if (lwtPublished && waitForLwt) {
 					lwtDeliveryComplete = isLwtDeliveryComplete();
 					logger.trace("{}: Completed LWT Delivery? {}", getClientId(), lwtDeliveryComplete);
 				} else {
@@ -1578,6 +1593,7 @@ public class TahuClient implements MqttCallbackExtended {
 					Thread.sleep(250);
 				}
 			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
 				logger.warn("{}: Interrupted while waiting for LWT", getClientId());
 			}
 		}
