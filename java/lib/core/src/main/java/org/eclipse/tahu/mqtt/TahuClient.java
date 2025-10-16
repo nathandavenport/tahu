@@ -947,14 +947,16 @@ public class TahuClient implements MqttCallbackExtended {
 				}
 				connectOptions.setKeepAliveInterval(keepAlive);
 				if (lwtTopic != null) {
-					logger.debug("{}: Setting WILL on {} with retain {}", getClientId(), lwtTopic, lwtRetain);
 					if (useSparkplugStatePayload) {
 						ObjectMapper mapper = new ObjectMapper();
 						lastStateDeathPayloadTimestamp = new Date().getTime();
 						StatePayload statePayload = new StatePayload(false, lastStateDeathPayloadTimestamp);
+						logger.debug("{}: Setting Sparkplug WILL on {} with retain={} and payload={}", getClientId(),
+								lwtTopic, lwtRetain, statePayload);
 						byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
 						connectOptions.setWill(lwtTopic, payload, MqttOperatorDefs.QOS1, lwtRetain);
 					} else {
+						logger.debug("{}: Setting WILL on {} with retain={}", getClientId(), lwtTopic, lwtRetain);
 						connectOptions.setWill(lwtTopic, lwtPayload, MqttOperatorDefs.QOS1, lwtRetain);
 					}
 				}
@@ -1438,17 +1440,21 @@ public class TahuClient implements MqttCallbackExtended {
 		synchronized (clientLock) {
 			if (birthTopic != null && client.isConnected()) {
 				try {
-					logger.debug("{}: Publishing BIRTH on {} with retain {}", getClientId(), birthTopic, birthRetain);
+
 					if (useSparkplugStatePayload) {
 						try {
 							ObjectMapper mapper = new ObjectMapper();
 							StatePayload statePayload = new StatePayload(true, lastStateDeathPayloadTimestamp);
+							logger.debug("{}: Publishing Sparkplug BIRTH on {} with retain={} and payload: {}",
+									getClientId(), birthTopic, birthRetain, statePayload);
 							byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
 							publish(birthTopic, payload, MqttOperatorDefs.QOS1, birthRetain);
 						} catch (Exception e) {
 							logger.error("{}: Failed to publish the BIRTH message on {}", getClientId(), birthTopic, e);
 						}
 					} else {
+						logger.debug("{}: Publishing BIRTH on {} with retain={}", getClientId(), birthTopic,
+								birthRetain);
 						publish(birthTopic, birthPayload, MqttOperatorDefs.QOS1, birthRetain);
 					}
 				} catch (TahuException ce) {
@@ -1468,8 +1474,6 @@ public class TahuClient implements MqttCallbackExtended {
 			boolean clientConnected = client != null && client.isConnected();
 			boolean lwtDeliveryComplete = false;
 			if (lwtTopic != null && clientConnected) {
-				logger.info("{}: Publishing LWT on {} with qos={} and retain={}", getClientId(), lwtTopic, lwtQoS,
-						lwtRetain);
 				boolean lwtPublished = false;
 				synchronized (lwtDeliveryLock) {
 					/*
@@ -1481,12 +1485,16 @@ public class TahuClient implements MqttCallbackExtended {
 						try {
 							ObjectMapper mapper = new ObjectMapper();
 							StatePayload statePayload = new StatePayload(false, lastStateDeathPayloadTimestamp);
+							logger.debug("{}: Publishing Sparkplug LWT on {} with qos={} and retain={} and payload: {}",
+									getClientId(), lwtTopic, lwtQoS, lwtRetain, statePayload);
 							byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
 							lwtDeliveryToken = publish(lwtTopic, payload, lwtQoS, lwtRetain);
 						} catch (Exception e) {
 							logger.error("{}: Failed to publish the LWT message on {}", getClientId(), lwtTopic, e);
 						}
 					} else {
+						logger.debug("{}: Publishing LWT on {} with qos={} and retain={}", getClientId(), lwtTopic,
+								lwtQoS, lwtRetain);
 						lwtDeliveryToken = publish(lwtTopic, lwtPayload, lwtQoS, lwtRetain);
 					}
 					if (lwtDeliveryToken != null) {
