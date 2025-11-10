@@ -1345,8 +1345,10 @@ public class TahuClient implements MqttCallbackExtended {
 										Thread.sleep(1000);
 
 										synchronized (clientLock) {
-											// Force the disconnect and return
-											client.disconnectForcibly(0, 1, false);
+											if (client != null) {
+												// Force the disconnect and return
+												client.disconnectForcibly(0, 1, false);
+											}
 										}
 										return;
 									} catch (Exception e) {
@@ -1361,9 +1363,15 @@ public class TahuClient implements MqttCallbackExtended {
 							public void onFailure(IMqttToken asyncActionToken, Throwable exception) {
 								synchronized (clientLock) {
 									try {
-										logger.error("{}: server {} - Failed to subscribe on {}", getClientId(),
-												getMqttServerName(), topicStr);
-										client.disconnectForcibly(0, 1, false);
+										if (client != null) {
+											logger.error(
+													"{}: server {} - Failed to subscribe on {} - forcing disconnect",
+													getClientId(), getMqttServerName(), topicStr);
+											client.disconnectForcibly(0, 1, false);
+										} else {
+											logger.error("{}: server {} - Failed to subscribe on {} - client is null",
+													getClientId(), getMqttServerName(), topicStr);
+										}
 									} catch (MqttException e) {
 										logger.error("{}: server {} - Failed disconnect on failed subscribe",
 												getClientId(), getMqttServerName(), e);
