@@ -102,19 +102,6 @@
     <connection>scm:git:git@github.com:eclipse/tahu.git</connection>
   </scm>
 
-<!--
-  <distributionManagement>
-    <snapshotRepository>
-      <id>ossrh</id>
-      <url>https://oss.sonatype.org/content/repositories/snapshots</url>
-    </snapshotRepository>
-    <repository>
-      <id>ossrh</id>
-      <url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
-    </repository>
-  </distributionManagement>
--->
-
   <modules>
     <module>lib/core/pom.xml</module>
 
@@ -255,48 +242,6 @@
           </execution>
         </executions>
       </plugin>
-<!--
-      <plugin>
--->
-        <!--
-          Use the Nexus Staging plugin as a full replacement for the standard
-          Maven Deploy plugin.
-          See https://github.com/sonatype/nexus-maven-plugins/tree/master/staging/maven-plugin
-          why this makes sense :-)
-          We can control whether we want to deploy to the Eclipse repo or Maven Central
-          by a combination of the version being a SNAPHOT or release version and property
-          skipStaging=true/false.
-          In any case we can take advantage of the plugin's "deferred deploy" feature which
-          makes sure that all artifacts of a multi-module project are deployed as a whole
-          at the end of the build process instead of deploying each module's artifacts
-          individually as part of building the module.
-        -->
-<!--
-        <groupId>org.sonatype.plugins</groupId>
-        <artifactId>nexus-staging-maven-plugin</artifactId>
-        <version>1.6.8</version>
-        <extensions>true</extensions>
-        <configuration>
-          <serverId>ossrh</serverId>
-          <nexusUrl>https://oss.sonatype.org/</nexusUrl>
-          <autoReleaseAfterClose>true</autoReleaseAfterClose>
-          <skipNexusStagingDeployMojo>false</skipNexusStagingDeployMojo>
-        </configuration>
--->
-        <!-- https://stackoverflow.com/questions/70153962/nexus-staging-maven-plugin-maven-deploy-failed-an-api-incompatibility-was-enco -->
-<!--
-        <dependencies>
-          <dependency>
-            <groupId>com.thoughtworks.xstream</groupId>
-            <artifactId>xstream</artifactId>
--->
-            <!-- apparently this needs to be exactly this version -->
-<!--
-            <version>1.4.15</version> 
-          </dependency>
-        </dependencies>
-      </plugin>
--->
       <!--
       The following is based on this: https://gitlab.eclipse.org/eclipsefdn/helpdesk/-/issues/6331
       -->
