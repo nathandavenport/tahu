@@ -253,7 +253,9 @@
           </execution>
         </executions>
       </plugin>
+<!--
       <plugin>
+-->
         <!--
           Use the Nexus Staging plugin as a full replacement for the standard
           Maven Deploy plugin.
@@ -267,6 +269,7 @@
           at the end of the build process instead of deploying each module's artifacts
           individually as part of building the module.
         -->
+<!--
         <groupId>org.sonatype.plugins</groupId>
         <artifactId>nexus-staging-maven-plugin</artifactId>
         <version>1.6.8</version>
@@ -277,14 +280,33 @@
           <autoReleaseAfterClose>true</autoReleaseAfterClose>
           <skipNexusStagingDeployMojo>false</skipNexusStagingDeployMojo>
         </configuration>
+-->
         <!-- https://stackoverflow.com/questions/70153962/nexus-staging-maven-plugin-maven-deploy-failed-an-api-incompatibility-was-enco -->
+<!--
         <dependencies>
           <dependency>
             <groupId>com.thoughtworks.xstream</groupId>
             <artifactId>xstream</artifactId>
-            <version>1.4.15</version> <!-- apparently this needs to be exactly this version -->
+-->
+            <!-- apparently this needs to be exactly this version -->
+<!--
+            <version>1.4.15</version> 
           </dependency>
         </dependencies>
+      </plugin>
+-->
+      <!--
+      The following is based on this: https://gitlab.eclipse.org/eclipsefdn/helpdesk/-/issues/6331
+      -->
+      <plugin>
+        <groupId>org.sonatype.central</groupId>
+        <artifactId>central-publishing-maven-plugin</artifactId>
+        <version>0.9.0</version>
+        <extensions>true</extensions>
+        <configuration>
+          <publishingServerId>central</publishingServerId>
+          <autoPublish>true</autoPublish>
+        </configuration>
       </plugin>
     </plugins>
     <extensions>
