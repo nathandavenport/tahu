@@ -102,6 +102,7 @@
     <connection>scm:git:git@github.com:eclipse/tahu.git</connection>
   </scm>
 
+<!--
   <distributionManagement>
     <snapshotRepository>
       <id>ossrh</id>
@@ -112,6 +113,7 @@
       <url>https://oss.sonatype.org/service/local/staging/deploy/maven2/</url>
     </repository>
   </distributionManagement>
+-->
 
   <modules>
     <module>lib/core/pom.xml</module>
