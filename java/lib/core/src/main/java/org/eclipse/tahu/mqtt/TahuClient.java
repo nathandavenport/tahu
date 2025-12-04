@@ -13,7 +13,7 @@
 
 package org.eclipse.tahu.mqtt;
 
-import java.net.URL;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -702,7 +702,7 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	public void connect() {
 		try {
-			new URL(mqttServerUrl.getMqttServerUrl()).toURI();
+			new URI(mqttServerUrl.getMqttServerUrl());
 		} catch (Exception e) {
 			logger.error("{}: Invalid MQTT Server URL: {}", getClientId(), mqttServerUrl.getMqttServerUrl());
 			return;
