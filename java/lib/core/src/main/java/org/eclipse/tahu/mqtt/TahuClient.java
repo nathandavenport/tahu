@@ -35,6 +35,7 @@ import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
 import org.eclipse.paho.client.mqttv3.MqttException;
 import org.eclipse.paho.client.mqttv3.MqttMessage;
 import org.eclipse.paho.client.mqttv3.MqttSecurityException;
+import org.eclipse.paho.client.mqttv3.util.Debug;
 import org.eclipse.tahu.exception.TahuErrorCode;
 import org.eclipse.tahu.exception.TahuException;
 import org.eclipse.tahu.message.model.StatePayload;
@@ -427,6 +428,33 @@ public class TahuClient implements MqttCallbackExtended {
 	public void resetAvailability() {
 		totalUptime = 0;
 		totalDowntime = 0;
+	}
+
+	public int getBufferedMessageCount() {
+		try {
+			return client.getBufferedMessageCount();
+		} catch (Exception e) {
+			logger.debug("Failed to get the MQTT Client Buffered Message Count", e);
+			return 0;
+		}
+	}
+
+	public int getInFlightMessageCount() {
+		try {
+			return client.getInFlightMessageCount();
+		} catch (Exception e) {
+			logger.debug("Failed to get the MQTT Client In-Flight Message Count", e);
+			return 0;
+		}
+	}
+
+	public Debug getDebug() {
+		try {
+			return client.getDebug();
+		} catch (Exception e) {
+			logger.debug("Failed to get the MQTT Client Debug info", e);
+			return null;
+		}
 	}
 
 	/**
