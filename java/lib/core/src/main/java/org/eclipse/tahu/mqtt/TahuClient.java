@@ -19,6 +19,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
@@ -28,7 +29,6 @@ import java.util.concurrent.Semaphore;
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
 import org.eclipse.paho.client.mqttv3.IMqttToken;
-import org.eclipse.paho.client.mqttv3.MqttAsyncClient;
 import org.eclipse.paho.client.mqttv3.MqttCallback;
 import org.eclipse.paho.client.mqttv3.MqttCallbackExtended;
 import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
@@ -83,7 +83,7 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * The Asynchronous MQTT Client and MQTTConnectOptions
 	 */
-	private MqttAsyncClient client = null;
+	private TahuMqttAsyncClient client = null;
 	MqttConnectOptions connectOptions = null;
 
 	/*
@@ -453,6 +453,30 @@ public class TahuClient implements MqttCallbackExtended {
 			return client.getDebug();
 		} catch (Exception e) {
 			logger.debug("Failed to get the MQTT Client Debug info", e);
+			return null;
+		}
+	}
+
+	public Properties getClientCommsDebug() {
+		if (client != null) {
+			return client.getClientCommsDebug();
+		} else {
+			return null;
+		}
+	}
+
+	public Properties getClientStateDebug() {
+		if (client != null) {
+			return client.getClientStateDebug();
+		} else {
+			return null;
+		}
+	}
+
+	public Properties getConOptions() {
+		if (client != null) {
+			return client.getConOptions();
+		} else {
 			return null;
 		}
 	}
@@ -848,7 +872,7 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * Attempt to connect.
 	 */
-	private IMqttToken attemptConnect(MqttAsyncClient client, MqttConnectOptions options, String ctx)
+	private IMqttToken attemptConnect(TahuMqttAsyncClient client, MqttConnectOptions options, String ctx)
 			throws MqttSecurityException, MqttException {
 		synchronized (clientLock) {
 			if (isConnected()) {
@@ -998,7 +1022,7 @@ public class TahuClient implements MqttCallbackExtended {
 				// Create the client instance
 				logger.info("{}: Creating the MQTT Client to {} on thread {}", getClientId(), getMqttServerUrl(),
 						Thread.currentThread().getName());
-				client = new MqttAsyncClient(getMqttServerUrl().toString(), getClientId().toString(), null);
+				client = new TahuMqttAsyncClient(getMqttServerUrl().toString(), getClientId().toString(), null);
 
 				// Set the callback handler
 				client.setCallback(callback);
@@ -1239,11 +1263,11 @@ public class TahuClient implements MqttCallbackExtended {
 
 	private class ConnectionMonitor implements Runnable {
 
-		private final MqttAsyncClient monitoredClient;
+		private final TahuMqttAsyncClient monitoredClient;
 		private final MqttClientId monitoredClientId;
 		private boolean keepRunning = true;
 
-		public ConnectionMonitor(MqttAsyncClient client, MqttClientId clientId) {
+		public ConnectionMonitor(TahuMqttAsyncClient client, MqttClientId clientId) {
 			this.monitoredClient = client;
 			this.monitoredClientId = clientId;
 		}
