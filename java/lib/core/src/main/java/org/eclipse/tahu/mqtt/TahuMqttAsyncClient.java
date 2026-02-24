@@ -6,6 +6,7 @@
  */
 package org.eclipse.tahu.mqtt;
 
+import java.util.Date;
 import java.util.Properties;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -16,6 +17,8 @@ import org.eclipse.paho.client.mqttv3.MqttPingSender;
 import org.eclipse.paho.client.mqttv3.internal.HighResolutionTimer;
 
 public class TahuMqttAsyncClient extends MqttAsyncClient {
+
+	private final Date clientInitDateTime = new Date();
 
 	public TahuMqttAsyncClient(String serverURI, String clientId, MqttClientPersistence persistence,
 			MqttPingSender pingSender, ScheduledExecutorService executorService,
@@ -40,6 +43,10 @@ public class TahuMqttAsyncClient extends MqttAsyncClient {
 
 	public TahuMqttAsyncClient(String serverURI, String clientId) throws MqttException {
 		super(serverURI, clientId);
+	}
+
+	public Date getClientInitDateTime() {
+		return clientInitDateTime;
 	}
 
 	public Properties getClientCommsDebug() {
