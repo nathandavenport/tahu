@@ -33,7 +33,7 @@
     <maven.bundle.version>5.1.1</maven.bundle.version>
     <paho.version>1.2.5</paho.version>
     <protobuf.version>3.25.5</protobuf.version>
-    <testng.version>6.9.10</testng.version>
+    <testng.version>6.14.3</testng.version>
   </properties>
 
   <groupId>org.eclipse.tahu</groupId>
@@ -125,7 +125,7 @@
     <dependency>
       <groupId>org.testng</groupId>
       <artifactId>testng</artifactId>
-      <version>6.9.10</version>
+      <version>${testng.version}</version>
       <scope>test</scope>
     </dependency>
     <dependency>
