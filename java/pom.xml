@@ -23,12 +23,12 @@
     <commons.compress.version>1.28.0</commons.compress.version>
     <commons.io.version>2.20.0</commons.io.version>
     <commons.lang3.version>3.19.0</commons.lang3.version>
-    <jackson.version>2.20.1</jackson.version>
-    <jackson.annotations.version>2.20</jackson.annotations.version>
+    <jackson.version>2.21.2</jackson.version>
+    <jackson.annotations.version>2.21</jackson.annotations.version>
     <junit.version>4.13.2</junit.version>
     <slf4j.version>2.0.17</slf4j.version>
     <jaxb.api.version>2.3.1</jaxb.api.version>
-    <logback.version>1.5.21</logback.version>
+    <logback.version>1.5.34</logback.version>
     <maven.compiler.version>3.14.1</maven.compiler.version>
     <maven.bundle.version>5.1.1</maven.bundle.version>
     <paho.version>1.2.5</paho.version>
