@@ -279,39 +279,51 @@
           </execution>
         </executions>
       </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-gpg-plugin</artifactId>
-        <version>1.6</version>
-        <executions>
-          <execution>
-            <id>sign-artifacts</id>
-            <phase>deploy</phase>
-            <goals>
-              <goal>sign</goal>
-            </goals>
-            <configuration>
-                <gpgArguments>
-                    <arg>--pinentry-mode</arg>
-                    <arg>loopback</arg>
-                </gpgArguments>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-      <!--
-      The following is based on this: https://gitlab.eclipse.org/eclipsefdn/helpdesk/-/issues/6331
-      -->
-      <plugin>
-        <groupId>org.sonatype.central</groupId>
-        <artifactId>central-publishing-maven-plugin</artifactId>
-        <version>0.9.0</version>
-        <extensions>true</extensions>
-        <configuration>
-          <publishingServerId>central</publishingServerId>
-          <autoPublish>true</autoPublish>
-        </configuration>
-      </plugin>
     </plugins>
   </build>
+
+  <!-- Maven Central publish path (GPG signing + Sonatype central-publishing). NOT active by default,
+       so CI builds that deploy to CodeArtifact never resolve/run these (the central-publishing build
+       extension was breaking the CodeArtifact mirror build). Activate with -Pcentral-release to publish
+       to Maven Central. -->
+  <profiles>
+    <profile>
+      <id>central-release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>1.6</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>deploy</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+                <configuration>
+                  <gpgArguments>
+                    <arg>--pinentry-mode</arg>
+                    <arg>loopback</arg>
+                  </gpgArguments>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+          <!-- https://gitlab.eclipse.org/eclipsefdn/helpdesk/-/issues/6331 -->
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.9.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>true</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
