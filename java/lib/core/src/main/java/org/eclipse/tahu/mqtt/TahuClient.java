@@ -136,7 +136,11 @@ public class TahuClient implements MqttCallbackExtended {
 	private long numMesgsArrived = 0;
 	private long lastNumMesgsArrived = 0;
 
-	private boolean disconnectInProgress = false;
+	/*
+	 * Read by publish() to tell an interrupt that is part of an intentional disconnect from one that has silently
+	 * dropped a message, so it is written and read from different threads.
+	 */
+	private volatile boolean disconnectInProgress = false;
 
 	private Object clientLock = new Object();
 	private ConnectionMonitorThread connectionMonitorThread;
@@ -557,9 +561,25 @@ public class TahuClient implements MqttCallbackExtended {
 						"MQTT client: " + clientId.getMqttClientId() + " is not connected");
 			}
 		} catch (InterruptedException e) {
+			// Always restore the interrupt for whatever is unwinding this thread
 			Thread.currentThread().interrupt();
-			logger.warn("Interrupted while trying to publish on {}", topic);
-			return null;
+
+			if (isDisconnectInProgress()) {
+				/*
+				 * The interrupt is part of an intentional disconnect, so the message was never meant to reach the MQTT
+				 * Server. There is nothing to recover and reporting a failure here would be noise.
+				 */
+				logger.debug("{}: Interrupted while trying to publish on {} during a disconnect", getClientId(), topic);
+				return null;
+			}
+
+			/*
+			 * The client is still expected to be running, so the message was silently dropped. Report it the same way
+			 * as every other publish failure so callers can retry or force a reconnect - returning null here loses
+			 * BIRTH and LWT messages with no indication that anything went wrong.
+			 */
+			logger.error("{}: Interrupted while trying to publish on {}", getClientId(), topic);
+			throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
 		} catch (Exception e) {
 			throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
 		}
@@ -1506,16 +1526,24 @@ public class TahuClient implements MqttCallbackExtended {
 				try {
 
 					if (useSparkplugStatePayload) {
+						byte[] payload;
 						try {
 							ObjectMapper mapper = new ObjectMapper();
 							StatePayload statePayload = new StatePayload(true, lastStateDeathPayloadTimestamp);
 							logger.debug("{}: Publishing Sparkplug BIRTH on {} with retain={} and payload: {}",
 									getClientId(), birthTopic, birthRetain, statePayload);
-							byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
-							publish(birthTopic, payload, MqttOperatorDefs.QOS1, birthRetain);
+							payload = mapper.writeValueAsString(statePayload).getBytes();
 						} catch (Exception e) {
-							logger.error("{}: Failed to publish the BIRTH message on {}", getClientId(), birthTopic, e);
+							// Reconnecting cannot fix a payload that will not encode, so there is nothing to recover
+							logger.error("{}: Failed to encode the BIRTH message on {}", getClientId(), birthTopic, e);
+							return;
 						}
+
+						/*
+						 * Deliberately outside the encode handler above - a failed publish must reach the recovery
+						 * below rather than being logged and swallowed.
+						 */
+						publish(birthTopic, payload, MqttOperatorDefs.QOS1, birthRetain);
 					} else {
 						logger.debug("{}: Publishing BIRTH on {} with retain={}", getClientId(), birthTopic,
 								birthRetain);
@@ -1546,16 +1574,24 @@ public class TahuClient implements MqttCallbackExtended {
 					 * it is being nullified in the Paho callback.
 					*/
 					if (useSparkplugStatePayload) {
+						byte[] payload;
 						try {
 							ObjectMapper mapper = new ObjectMapper();
 							StatePayload statePayload = new StatePayload(false, lastStateDeathPayloadTimestamp);
 							logger.debug("{}: Publishing Sparkplug LWT on {} with qos={} and retain={} and payload: {}",
 									getClientId(), lwtTopic, lwtQoS, lwtRetain, statePayload);
-							byte[] payload = mapper.writeValueAsString(statePayload).getBytes();
-							lwtDeliveryToken = publish(lwtTopic, payload, lwtQoS, lwtRetain);
+							payload = mapper.writeValueAsString(statePayload).getBytes();
 						} catch (Exception e) {
-							logger.error("{}: Failed to publish the LWT message on {}", getClientId(), lwtTopic, e);
+							// Nothing can be published if the payload will not encode
+							logger.error("{}: Failed to encode the LWT message on {}", getClientId(), lwtTopic, e);
+							throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
 						}
+
+						/*
+						 * Deliberately outside the encode handler above so a failed publish reaches the caller rather
+						 * than being logged and swallowed.
+						 */
+						lwtDeliveryToken = publish(lwtTopic, payload, lwtQoS, lwtRetain);
 					} else {
 						logger.debug("{}: Publishing LWT on {} with qos={} and retain={}", getClientId(), lwtTopic,
 								lwtQoS, lwtRetain);
