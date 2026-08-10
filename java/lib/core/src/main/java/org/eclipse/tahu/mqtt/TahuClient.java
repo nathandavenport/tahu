@@ -853,7 +853,17 @@ public class TahuClient implements MqttCallbackExtended {
 			if (client != null) {
 				try {
 					if (publishLwt) {
-						this.publishLwt(waitForLwt);
+						/*
+						 * A failed LWT publish must not abort the disconnect. Only MqttException is handled below, so
+						 * letting a TahuException out here would skip disconnectForcibly() and close() while the
+						 * finally block still nulls the client, leaking the Paho client with no way to reach it again.
+						 */
+						try {
+							this.publishLwt(waitForLwt);
+						} catch (Exception e) {
+							logger.error("{}: Failed to publish the LWT during disconnect - continuing",
+									getClientId(), e);
+						}
 					}
 
 					// FIXME - remove This sleep is necessary due to:
@@ -1582,9 +1592,9 @@ public class TahuClient implements MqttCallbackExtended {
 									getClientId(), lwtTopic, lwtQoS, lwtRetain, statePayload);
 							payload = mapper.writeValueAsString(statePayload).getBytes();
 						} catch (Exception e) {
-							// Nothing can be published if the payload will not encode
+							// Reconnecting cannot fix a payload that will not encode, so there is nothing to recover
 							logger.error("{}: Failed to encode the LWT message on {}", getClientId(), lwtTopic, e);
-							throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
+							return;
 						}
 
 						/*
