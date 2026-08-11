@@ -14,10 +14,12 @@
 package org.eclipse.tahu.mqtt;
 
 import java.net.URI;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
+import java.util.Deque;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
@@ -25,6 +27,7 @@ import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
 import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
@@ -54,6 +57,9 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final long DEFAULT_CONNECT_RETRY_INTERVAL = 1000;
 	private static final long DEFAULT_CONNECT_MONITOR_INTERVAL = 10000;
 	private static final long DEFAULT_CONNECT_ATTEMPT_TIMEOUT = 30000;
+	private static final int DEFAULT_PUBLISH_BUFFER_CAPACITY = 10000;
+	private static final long PUBLISH_BUFFER_POLL_INTERVAL = 250;
+	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 3;
 
 	private Thread connectRunnableThread;
 	private ConnectRunnable connectRunnable;
@@ -83,7 +89,7 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * The Asynchronous MQTT Client and MQTTConnectOptions
 	 */
-	private TahuMqttAsyncClient client = null;
+	private volatile TahuMqttAsyncClient client = null;
 	MqttConnectOptions connectOptions = null;
 
 	/*
@@ -125,6 +131,36 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private int maxTopicsPerSubscribe = 256;
 
+	/*
+	 * The maximum number of messages held in the FIFO publish buffer.
+	 *
+	 * A QoS > 0 publish needs an in-flight permit, and permits are only returned by deliveryComplete() when the MQTT
+	 * server ACKs a message. Rather than waiting for one - which is what deadlocked this client against
+	 * deliveryComplete() - a message that cannot get a permit immediately is buffered and sent by the drain thread once
+	 * a permit frees up. Once anything is buffered, every subsequent QoS > 0 message is buffered too, so ordering among
+	 * them is preserved.
+	 *
+	 * QoS 0 is never buffered - it needs no permit and is always published immediately, so it can overtake buffered
+	 * QoS > 0 messages during a stall.
+	 *
+	 * The buffer MUST stay bounded. An unbounded one only moves the failure from thread exhaustion to heap exhaustion
+	 * under a sustained server stall. At capacity the newest publish is rejected with a TahuException so the caller can
+	 * fall back to its own store-and-forward rather than lose the message silently.
+	 */
+	private volatile int publishBufferCapacity = DEFAULT_PUBLISH_BUFFER_CAPACITY;
+
+	/*
+	 * The FIFO publish buffer, the lock guarding both it and publish ordering, and the thread that drains it.
+	 *
+	 * publishOrderLock guards the decision "publish now or queue" so that no message can overtake one already queued.
+	 * Lock order is always publishOrderLock -> messageLock; deliveryComplete() takes messageLock only, so there is no
+	 * cycle and permits can always be returned.
+	 */
+	private final Object publishOrderLock = new Object();
+	private final Deque<BufferedPublish> publishBuffer = new ArrayDeque<>();
+	private PublishBufferDrain publishBufferDrain;
+	private Thread publishBufferDrainThread;
+
 	private Date connectTime;
 	private Date disconnectTime;
 	private Date onlineDate;
@@ -148,8 +184,11 @@ public class TahuClient implements MqttCallbackExtended {
 	// Whether or not the BIRTH should be published on connect and controls the STATE of the client
 	private boolean onlineState;
 
-	private Semaphore semaphore;
-	private Set<Integer> lockedMessageSet;
+	// volatile: written in connect() under messageLock, but read under publishOrderLock in publishOrBuffer() and
+	// with no lock at all by the publish buffer drain thread. Without volatile there is no happens-before edge to
+	// those readers, so a reconnect's replacement instance may not be seen promptly.
+	private volatile Semaphore semaphore;
+	private volatile Set<Integer> lockedMessageSet;
 	private final Object messageLock;
 
 	public TahuClient(final MqttClientId clientId, final MqttServerName mqttServerName,
@@ -255,6 +294,14 @@ public class TahuClient implements MqttCallbackExtended {
 
 	public int getMaxInflightMessages() {
 		return this.maxInFlightMessages;
+	}
+
+	public void setPublishBufferCapacity(int publishBufferCapacity) {
+		this.publishBufferCapacity = publishBufferCapacity;
+	}
+
+	public int getPublishBufferCapacity() {
+		return this.publishBufferCapacity;
 	}
 
 	public void setDoLatencyCheck(boolean state) {
@@ -517,51 +564,339 @@ public class TahuClient implements MqttCallbackExtended {
 		this.offlineDate = new Date();
 	}
 
+	/**
+	 * Publishes a message, or buffers it in FIFO order if it cannot be published immediately.
+	 *
+	 * A QoS > 0 message needs an in-flight permit. Rather than waiting for one - which is what deadlocked this client
+	 * against {@link #deliveryComplete(IMqttDeliveryToken)} - a message that cannot get a permit immediately is
+	 * appended to the publish buffer and sent later by the drain thread.
+	 *
+	 * Once the buffer is non-empty every subsequent QoS > 0 message is appended to it until it drains, so ordering
+	 * among acknowledged messages is preserved. QoS 0 is never buffered - it takes no permit and is always sent
+	 * immediately, so it may overtake queued QoS > 0 messages while the in-flight window is exhausted.
+	 *
+	 * @return the delivery token if the message was published inline, or <b>null</b> if it was buffered. A null return
+	 *         means the message is queued, not lost - callers must not treat it as a failure.
+	 * @throws TahuException if the client is not usable, the publish itself failed, or the buffer is full
+	 */
 	public IMqttDeliveryToken publish(String topic, byte[] payload, int qos, boolean retained) throws TahuException {
 		try {
 			if (client == null) {
 				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
 						"MQTT client: " + clientId.getMqttClientId() + " is null");
 			} else if (client.isConnected()) {
-				if (qos == 0) {
-					logger.debug("{}: Publishing with QoS0 on {}, Payload size = {}", getClientId(), topic,
-							payload.length);
-					return client.publish(topic, payload, qos, retained);
-				} else {
-					synchronized (messageLock) {
-						semaphore.acquire();
-						logger.trace("{}: Took permit in publish - available permits remaining: {}", getClientId(),
-								semaphore.availablePermits());
-
-						IMqttDeliveryToken token = null;
-						try {
-							logger.debug("{}: Publishing with QoS{} on {}, Payload size = {}", getClientId(), qos,
-									topic, payload.length);
-							token = client.publish(topic, payload, qos, retained);
-							lockedMessageSet.add(token.getMessageId());
-							return token;
-						} catch (Throwable t) {
-							logger.error(
-									"{}: Failed to publish on {} - retrying and releasing permit - available permits: {}",
-									getClientId(), topic, semaphore.availablePermits(), t);
-							if (token != null) {
-								semaphore.release();
-								lockedMessageSet.remove(token.getMessageId());
-							}
-							throw new TahuException(TahuErrorCode.INTERNAL_ERROR, t);
-						}
-					}
-				}
+				return publishOrBuffer(topic, payload, qos, retained);
 			} else {
 				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
 						"MQTT client: " + clientId.getMqttClientId() + " is not connected");
 			}
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-			logger.warn("Interrupted while trying to publish on {}", topic);
-			return null;
+		} catch (TahuException e) {
+			throw e;
 		} catch (Exception e) {
 			throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
+		}
+	}
+
+	/**
+	 * Decides - atomically with respect to the buffer - whether a message is published now or queued.
+	 *
+	 * The whole decision runs under {@link #publishOrderLock} so that no message can overtake one already queued. It
+	 * NEVER waits for a permit while holding a lock: the inline path uses a non-blocking {@link Semaphore#tryAcquire()}
+	 * and falls back to buffering. That is what keeps {@link #deliveryComplete(IMqttDeliveryToken)} - which needs only
+	 * {@link #messageLock} - able to return permits at all times.
+	 *
+	 * Lock order is always publishOrderLock -> messageLock. deliveryComplete() takes messageLock only, so there is no
+	 * cycle.
+	 */
+	private IMqttDeliveryToken publishOrBuffer(String topic, byte[] payload, int qos, boolean retained)
+			throws TahuException {
+		synchronized (publishOrderLock) {
+			// QoS 0 takes no permit and is never subject to backpressure, so it is always sent immediately -
+			// it is never buffered, even while QoS > 0 messages are queued. This means a QoS 0 message CAN
+			// overtake buffered QoS > 0 messages during a stall. That is deliberate: MQTT only orders within a
+			// QoS level, and holding live fire-and-forget data behind a stalled acknowledged queue would make it
+			// stale for no delivery benefit.
+			if (qos == 0) {
+				try {
+					logger.debug("{}: Publishing with QoS0 on {}, Payload size = {}", getClientId(), topic,
+							payload.length);
+					return client.publish(topic, payload, qos, retained);
+				} catch (Throwable t) {
+					throw new TahuException(TahuErrorCode.INTERNAL_ERROR, t);
+				}
+			}
+
+			// Order preservation among QoS > 0: anything queued means this message queues behind it
+			if (!publishBuffer.isEmpty()) {
+				bufferPublish(topic, payload, qos, retained, "buffer is draining");
+				return null;
+			}
+
+			final Semaphore permitHolder = semaphore;
+			if (permitHolder == null) {
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR, "MQTT client: " + clientId.getMqttClientId()
+						+ " has no in-flight window - it has never connected");
+			}
+
+			// Non-blocking on purpose - never wait for a permit while holding a lock
+			if (!permitHolder.tryAcquire()) {
+				bufferPublish(topic, payload, qos, retained, "no in-flight permit available");
+				return null;
+			}
+
+			logger.trace("{}: Took permit in publish - available permits remaining: {}", getClientId(),
+					permitHolder.availablePermits());
+			return publishWithPermit(permitHolder, topic, payload, qos, retained);
+		}
+	}
+
+	/**
+	 * Publishes a message for which an in-flight permit has already been taken.
+	 *
+	 * Ownership of the permit transfers to this method: on success it belongs to
+	 * {@link #deliveryComplete(IMqttDeliveryToken)}, and on failure it is released here. Callers must not release it
+	 * themselves.
+	 *
+	 * Must be called holding {@link #publishOrderLock}.
+	 */
+	private IMqttDeliveryToken publishWithPermit(Semaphore permitHolder, String topic, byte[] payload, int qos,
+			boolean retained) throws TahuException {
+		// Reentrant - every caller already holds this. Taken explicitly so publish ordering cannot be bypassed.
+		synchronized (publishOrderLock) {
+			boolean handedOff = false;
+			try {
+				synchronized (messageLock) {
+					logger.debug("{}: Publishing with QoS{} on {}, Payload size = {}", getClientId(), qos, topic,
+							payload.length);
+					IMqttDeliveryToken token = client.publish(topic, payload, qos, retained);
+					lockedMessageSet.add(token.getMessageId());
+					handedOff = true;
+					return token;
+				}
+			} catch (Throwable t) {
+				logger.error("{}: Failed to publish on {} - releasing permit - available permits: {}", getClientId(),
+						topic, permitHolder.availablePermits(), t);
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR, t);
+			} finally {
+				// Release only if the message never reached the MQTT client. Once it has, the permit belongs to
+				// deliveryComplete(). If lockedMessageSet.add() is what failed, releasing here is still correct -
+				// deliveryComplete()'s remove() will return false and it will not release a second time.
+				if (!handedOff) {
+					permitHolder.release();
+				}
+			}
+		}
+	}
+
+	/**
+	 * Appends a message to the publish buffer. Must be called holding {@link #publishOrderLock}.
+	 *
+	 * The buffer is bounded. An unbounded one would simply move the original failure mode from thread exhaustion to
+	 * heap exhaustion under a sustained server stall, so at capacity the newest message is rejected and the caller is
+	 * told - letting it fall back to its own store-and-forward rather than silently losing data.
+	 *
+	 * INVARIANT: only QoS > 0 messages are ever buffered. The drain thread relies on this - it takes a permit before
+	 * dequeuing, so a buffered QoS 0 message (which needs no permit and is never ACKed) would stall the buffer for as
+	 * long as the in-flight window stayed exhausted. TahuClientPublishBufferTest#bufferNeverHoldsQos0Messages guards it.
+	 */
+	private void bufferPublish(String topic, byte[] payload, int qos, boolean retained, String reason)
+			throws TahuException {
+		// Reentrant - every caller already holds this. Taken explicitly so the buffer can never be mutated without it.
+		synchronized (publishOrderLock) {
+			if (publishBuffer.size() >= getPublishBufferCapacity()) {
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+						"MQTT client: " + clientId.getMqttClientId() + " publish buffer is full ("
+								+ publishBuffer.size() + "/" + getPublishBufferCapacity()
+								+ ") - rejecting publish on " + topic);
+			}
+
+			publishBuffer.addLast(new BufferedPublish(topic, payload, qos, retained));
+			if (publishBuffer.size() == 1) {
+				logger.warn("{}: Buffering publish on {} - {} - subsequent messages will queue behind it",
+						getClientId(), topic, reason);
+			} else {
+				logger.debug("{}: Buffering publish on {} - {} - buffer depth is now {}", getClientId(), topic, reason,
+						publishBuffer.size());
+			}
+			publishOrderLock.notifyAll();
+		}
+	}
+
+	/**
+	 * @return the number of messages currently waiting in the publish buffer. 0 in normal operation - a sustained
+	 *         non-zero value means the MQTT server is not acknowledging fast enough.
+	 */
+	public int getPublishBufferDepth() {
+		synchronized (publishOrderLock) {
+			return publishBuffer.size();
+		}
+	}
+
+	/*
+	 * A message that could not be published immediately and is waiting its turn in the publish buffer.
+	 */
+	private static class BufferedPublish {
+		private final String topic;
+		private final byte[] payload;
+		private final int qos;
+		private final boolean retained;
+
+		/*
+		 * Send attempts made so far. Paho only retries messages it has accepted; a throw from its publish() means the
+		 * message never entered its outbound queue or persistence, so nothing else will resend it.
+		 */
+		private int attempts;
+
+		private BufferedPublish(String topic, byte[] payload, int qos, boolean retained) {
+			this.topic = topic;
+			this.payload = payload;
+			this.qos = qos;
+			this.retained = retained;
+		}
+	}
+
+	private void startPublishBufferDrainThread() {
+		synchronized (publishOrderLock) {
+			if (publishBufferDrain != null) {
+				return;
+			}
+			publishBufferDrain = new PublishBufferDrain();
+			publishBufferDrainThread = new Thread(publishBufferDrain,
+					"TahuPublishBufferDrain-" + getClientId().getMqttClientId());
+			publishBufferDrainThread.setDaemon(true);
+			publishBufferDrainThread.start();
+			logger.debug("{}: Started the publish buffer drain thread", getClientId());
+		}
+	}
+
+	private void shutdownPublishBufferDrainThread() {
+		final Thread drainThread;
+		synchronized (publishOrderLock) {
+			if (publishBufferDrain == null) {
+				return;
+			}
+			publishBufferDrain.setKeepRunning(false);
+			drainThread = publishBufferDrainThread;
+			publishBufferDrain = null;
+			publishBufferDrainThread = null;
+			if (!publishBuffer.isEmpty()) {
+				logger.warn("{}: Discarding {} buffered publishes on shutdown", getClientId(), publishBuffer.size());
+				publishBuffer.clear();
+			}
+			publishOrderLock.notifyAll();
+		}
+		if (drainThread != null) {
+			drainThread.interrupt();
+		}
+	}
+
+	/**
+	 * Puts a failed send back at the head of the buffer, or drops it once it has used up its attempts.
+	 *
+	 * Paho does not rescue this message. Its QoS 1/2 redelivery only covers messages already accepted into its
+	 * outbound queue and persistence, and a throw from its publish() means this one never got that far. If it is not
+	 * re-queued here it is gone.
+	 *
+	 * The realistic failures are transient and clear on their own - REASON_CODE_MAX_INFLIGHT (32202) when Tahu's
+	 * permit count has drifted above Paho's window, or REASON_CODE_CLIENT_NOT_CONNECTED (32104) if the connection drops
+	 * between the check and the send - so a first failure is not a reason to discard data.
+	 *
+	 * Attempts are bounded because a message that can never be sent would otherwise sit at the head forever and block
+	 * everything queued behind it.
+	 */
+	private void requeueOrDrop(BufferedPublish attempted, Throwable cause) {
+		if (attempted == null) {
+			return;
+		}
+
+		synchronized (publishOrderLock) {
+			attempted.attempts++;
+			if (attempted.attempts < MAX_BUFFERED_PUBLISH_ATTEMPTS) {
+				publishBuffer.addFirst(attempted);
+				logger.warn("{}: Failed to send buffered publish on {} - re-queued at head, attempt {} of {}",
+						getClientId(), attempted.topic, attempted.attempts, MAX_BUFFERED_PUBLISH_ATTEMPTS, cause);
+			} else {
+				logger.error("{}: Dropping buffered publish on {} after {} failed attempts", getClientId(),
+						attempted.topic, attempted.attempts, cause);
+			}
+		}
+	}
+
+	/*
+	 * Drains the publish buffer in FIFO order as in-flight permits become available.
+	 *
+	 * Permits are acquired WITHOUT holding publishOrderLock - only the dequeue-and-publish step takes it - so this
+	 * thread can never block a caller or deliveryComplete().
+	 *
+	 * Relies on the buffer holding only QoS > 0 messages - see bufferPublish().
+	 */
+	private class PublishBufferDrain implements Runnable {
+
+		private volatile boolean keepRunning = true;
+
+		private void setKeepRunning(boolean keepRunning) {
+			this.keepRunning = keepRunning;
+		}
+
+		@Override
+		public void run() {
+			while (keepRunning) {
+				try {
+					synchronized (publishOrderLock) {
+						while (keepRunning && publishBuffer.isEmpty()) {
+							publishOrderLock.wait();
+						}
+						if (!keepRunning) {
+							return;
+						}
+					}
+
+					if (semaphore == null || client == null || !client.isConnected()) {
+						// Nothing can be sent yet - leave the buffer intact and re-check shortly
+						Thread.sleep(PUBLISH_BUFFER_POLL_INTERVAL);
+						continue;
+					}
+
+					// Every buffered message is QoS > 0 - publishOrBuffer() sends QoS 0 straight to the MQTT
+					// client and never queues it - so a permit is always required here.
+					final Semaphore permitHolder = semaphore;
+					if (!permitHolder.tryAcquire(PUBLISH_BUFFER_POLL_INTERVAL, TimeUnit.MILLISECONDS)) {
+						continue;
+					}
+
+					boolean permitOwnershipTransferred = false;
+					BufferedPublish attempted = null;
+					try {
+						synchronized (publishOrderLock) {
+							BufferedPublish head = publishBuffer.peekFirst();
+							if (head == null) {
+								continue;
+							}
+
+							publishBuffer.removeFirst();
+							attempted = head;
+							permitOwnershipTransferred = true;
+							publishWithPermit(permitHolder, head.topic, head.payload, head.qos, head.retained);
+
+							attempted = null;
+							if (publishBuffer.isEmpty()) {
+								logger.info("{}: Publish buffer drained", getClientId());
+							}
+						}
+					} catch (Throwable t) {
+						requeueOrDrop(attempted, t);
+					} finally {
+						if (!permitOwnershipTransferred) {
+							permitHolder.release();
+						}
+					}
+				} catch (InterruptedException ie) {
+					Thread.currentThread().interrupt();
+					return;
+				} catch (Throwable t) {
+					logger.error("{}: Publish buffer drain thread error", getClientId(), t);
+				}
+			}
 		}
 	}
 
@@ -822,6 +1157,12 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			try {
+				shutdownPublishBufferDrainThread();
+			} catch (Exception e) {
+				logger.error("{}: Failed to shutdown publish buffer drain thread", getClientId());
+			}
+
+			try {
 				if (connectRunnable != null && connectRunnableThread != null) {
 					connectRunnable.stopConnectAttempts();
 					connectRunnableThread.interrupt();
@@ -1022,6 +1363,7 @@ public class TahuClient implements MqttCallbackExtended {
 					semaphore = new Semaphore(getMaxInflightMessages(), true);
 					lockedMessageSet = ConcurrentHashMap.newKeySet();
 				}
+				startPublishBufferDrainThread();
 
 				// Create the client instance
 				logger.info("{}: Creating the MQTT Client to {} on thread {}", getClientId(), getMqttServerUrl(),
@@ -1210,29 +1552,12 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 
 		private void handlePublish() throws Exception {
-			if (qos == 0) {
-				logger.debug("{}: Publishing with QoS0 on {}, Payload size = {}", getClientId(), topic, payload.length);
-				client.publish(topic, payload, qos, retained);
-			} else {
-				synchronized (messageLock) {
-					semaphore.acquire();
-					logger.trace("{}: Took permit - available permits remaining: {}", getClientId(),
-							semaphore.availablePermits());
-
-					IMqttDeliveryToken token = null;
-					try {
-						logger.debug("{}: Publishing on {}, Payload size = {}", getClientId(), topic, payload.length);
-						token = client.publish(topic, payload, qos, retained);
-						lockedMessageSet.add(token.getMessageId());
-					} catch (Throwable t) {
-						logger.error("{}: Failed to publish on {} - releasing permit - available permits: {}",
-								getClientId(), topic, semaphore.availablePermits(), t);
-						if (token != null) {
-							semaphore.release();
-							lockedMessageSet.remove(token.getMessageId());
-						}
-					}
-				}
+			try {
+				// Same path as publish() so async publishes cannot jump ahead of anything already buffered
+				publishOrBuffer(topic, payload, qos, retained);
+			} catch (TahuException e) {
+				// Swallowed rather than rethrown so the retry loop in run() keeps its existing behavior
+				logger.error("{}: Failed to publish on {} - {}", getClientId(), topic, e.getMessage());
 			}
 		}
 	}
