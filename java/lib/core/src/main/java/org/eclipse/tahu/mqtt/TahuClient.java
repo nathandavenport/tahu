@@ -158,6 +158,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private final Object publishOrderLock = new Object();
 	private final Deque<BufferedPublish> publishBuffer = new ArrayDeque<>();
+	/*
+	 * Cumulative count of publishes rejected because the buffer was full. Guarded by publishOrderLock like the
+	 * buffer itself. Never reset while the client lives - it is a lifetime counter, not a gauge, so a consumer
+	 * can see that loss happened even if the buffer has since drained.
+	 */
+	private long publishBufferRejectedMessageCount;
+
 	private PublishBufferDrain publishBufferDrain;
 	private Thread publishBufferDrainThread;
 
@@ -704,6 +711,7 @@ public class TahuClient implements MqttCallbackExtended {
 		// Reentrant - every caller already holds this. Taken explicitly so the buffer can never be mutated without it.
 		synchronized (publishOrderLock) {
 			if (publishBuffer.size() >= getPublishBufferCapacity()) {
+				publishBufferRejectedMessageCount++;
 				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
 						"MQTT client: " + clientId.getMqttClientId() + " publish buffer is full ("
 								+ publishBuffer.size() + "/" + getPublishBufferCapacity()
@@ -729,6 +737,18 @@ public class TahuClient implements MqttCallbackExtended {
 	public int getPublishBufferDepth() {
 		synchronized (publishOrderLock) {
 			return publishBuffer.size();
+		}
+	}
+
+	/**
+	 * @return the number of publishes rejected because the publish buffer was full, for the life of this client. Any
+	 *         non-zero value means the MQTT server stalled for longer than the buffer could absorb. Whether those
+	 *         messages were then lost or stored depends on the caller - {@link #publish(String, byte[], int, boolean)}
+	 *         throws on rejection so the caller can fall back to its own store and forward.
+	 */
+	public long getPublishBufferRejectedMessageCount() {
+		synchronized (publishOrderLock) {
+			return publishBufferRejectedMessageCount;
 		}
 	}
 
