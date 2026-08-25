@@ -41,6 +41,8 @@ import org.testng.annotations.Test;
 /**
  * Tests for the FIFO publish buffer added to {@link TahuClient}.
  *
+ * IMM-5395 - MQTT Transmission UNS Transmitter Thread Explosion / OOM.
+ *
  * These exercise the class against a fake Paho client rather than a broker, so the in-flight window can be held at zero
  * deterministically - which is the state that used to deadlock the client permanently.
  */
@@ -73,7 +75,7 @@ public class TahuClientPublishBufferTest {
 	// ------------------------------------------------------------------------------------------------------------
 
 	/**
-	 * The regression test for the Sanofi incident.
+	 * The regression test for IMM-5395.
 	 *
 	 * With the window exhausted, publish() must return promptly instead of parking while holding messageLock. If this
 	 * hangs, the deadlock is back.
