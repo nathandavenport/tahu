@@ -479,6 +479,111 @@ public class TahuClientPublishBufferTest {
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
+	// Disconnect and the LWT (IMM-5460)
+	// ------------------------------------------------------------------------------------------------------------
+
+	/**
+	 * IMM-5460. The LWT is the only death certificate on a clean DISCONNECT, because the MQTT server suppresses the
+	 * Will. With the in-flight window exhausted the acknowledged publish would be buffered - and the buffer is torn
+	 * down moments later - so it must fall back to QoS 0 and actually leave the process.
+	 *
+	 * Asserts the fallback rather than the disconnect ordering: it calls publishLwt() directly, so it does not need a
+	 * connected Paho client to tear down.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void lwtFallsBackToQos0WhenItCannotBePublishedAtItsConfiguredQos() throws Exception {
+		wire(0, 8);
+		configureLwt(1);
+
+		tahuClient.publishLwt(false);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(LWT_TOPIC),
+				"The LWT must reach the MQTT client even with no in-flight permit available");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0,
+				"The LWT must not be left sitting in the buffer - the fallback exists so it is not queued at all");
+		Assert.assertEquals(availablePermits(), 0, "QoS 0 must not consume an in-flight permit");
+	}
+
+	/** With a permit free there is nothing to fall back from, so the configured QoS is used and acknowledged. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void lwtUsesItsConfiguredQosWhenAPermitIsAvailable() throws Exception {
+		wire(4, 8);
+		configureLwt(1);
+
+		tahuClient.publishLwt(false);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(LWT_TOPIC));
+		Assert.assertEquals(availablePermits(), 3, "A QoS 1 LWT must take a permit, so it can be acknowledged");
+	}
+
+	/**
+	 * IMM-5460 / IMM-5458. The drain thread is started by connect() before the Paho client is built, so a disconnect
+	 * that finds no client still has one to stop. Moving the shutdown below the LWT publish put it inside the
+	 * 'client != null' arm, which is exactly how this path would have been left orphaned.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void disconnectStopsTheDrainThreadWhenThereIsNoClient() throws Exception {
+		wire(0, 8);
+		startDrain();
+		Assert.assertNotNull(get(tahuClient, "publishBufferDrainThread"), "Precondition: the drain thread is running");
+
+		set(tahuClient, "client", null);
+		tahuClient.disconnect(0, 1, false, false, false);
+
+		Assert.assertNull(get(tahuClient, "publishBufferDrain"), "The drain must be stopped by a no-client disconnect");
+		Assert.assertNull(get(tahuClient, "publishBufferDrainThread"), "The drain thread reference must be cleared");
+	}
+
+	/**
+	 * The drain wait is what lets the LWT keep its configured QoS. With the buffer already empty it returns at once and
+	 * the LWT goes inline at QoS 1, taking a permit so it can be acknowledged - no fallback.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void disconnectPublishesTheLwtAtItsConfiguredQosWhenTheBufferIsClear() throws Exception {
+		wire(4, 8);
+		configureLwt(1);
+
+		tahuClient.disconnect(0, 1, true, true, false);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(LWT_TOPIC));
+		Assert.assertTrue(fakeClient.disconnectSent, "A delivered LWT must still be followed by a clean DISCONNECT");
+	}
+
+	/**
+	 * IMM-5460 last resort. Every route to publishing the death certificate has failed, so a clean DISCONNECT would
+	 * suppress the Will and leave subscribers with nothing. The connection must drop instead, so the MQTT server
+	 * publishes the Will it already holds from connect().
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void disconnectSuppressesTheDisconnectPacketWhenTheLwtCannotBePublished() throws Exception {
+		wire(4, 8);
+		configureLwt(1);
+		fakeClient.failNextPublishes(Integer.MAX_VALUE);
+
+		tahuClient.disconnect(0, 1, true, true, false);
+
+		Assert.assertTrue(fakeClient.disconnectForciblyCalled, "The disconnect must still complete");
+		Assert.assertFalse(fakeClient.disconnectSent,
+				"With no death certificate published, the DISCONNECT must be withheld so the Will fires");
+	}
+
+	/** A client with no LWT configured has nothing to escalate over, so the disconnect stays clean. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void disconnectSendsTheDisconnectPacketWhenThereIsNoLwt() throws Exception {
+		wire(4, 8);
+
+		tahuClient.disconnect(0, 1, true, true, false);
+
+		Assert.assertTrue(fakeClient.disconnectSent, "No LWT configured is not a failure to publish one");
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
 	// Harness
 	// ------------------------------------------------------------------------------------------------------------
 
@@ -491,6 +596,15 @@ public class TahuClientPublishBufferTest {
 		set(tahuClient, "semaphore", new Semaphore(availablePermits, true));
 		set(tahuClient, "lockedMessageSet", ConcurrentHashMap.newKeySet());
 		set(tahuClient, "maxInFlightMessages", maxInflight);
+	}
+
+	private static final String LWT_TOPIC = "spBv1.0/G1/NDEATH/E1";
+
+	private void configureLwt(int qos) throws Exception {
+		set(tahuClient, "lwtTopic", LWT_TOPIC);
+		set(tahuClient, "lwtPayload", "death".getBytes());
+		set(tahuClient, "lwtQoS", qos);
+		set(tahuClient, "lwtRetain", false);
 	}
 
 	private void startDrain() throws Exception {
@@ -586,6 +700,8 @@ public class TahuClientPublishBufferTest {
 		private final AtomicInteger nextMessageId = new AtomicInteger(1);
 		private volatile TahuClient ackTarget;
 		private volatile ExecutorService ackExecutor;
+		private volatile boolean disconnectSent;
+		private volatile boolean disconnectForciblyCalled;
 
 		private FakeMqttClient() throws MqttException {
 			super("tcp://localhost:1883", "test-client", null);
@@ -628,6 +744,22 @@ public class TahuClientPublishBufferTest {
 		@Override
 		public boolean isConnected() {
 			return connected.get();
+		}
+
+		/*
+		 * Recorded rather than performed. The real methods would throw on a client that never connected, and the
+		 * sendDisconnectPacket flag is the observable for the IMM-5460 Will escalation.
+		 */
+		@Override
+		public void disconnectForcibly(long quiesceTimeout, long disconnectTimeout, boolean sendDisconnectPacket) {
+			this.disconnectSent = sendDisconnectPacket;
+			this.disconnectForciblyCalled = true;
+			connected.set(false);
+		}
+
+		@Override
+		public void close() {
+			// no-op - nothing to release
 		}
 
 		@Override

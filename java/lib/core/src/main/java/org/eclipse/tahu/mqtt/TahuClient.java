@@ -61,6 +61,13 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final long PUBLISH_BUFFER_POLL_INTERVAL = 250;
 	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 3;
 
+	/*
+	 * How long disconnect() will wait for the publish buffer to drain before publishing the LWT. Short on purpose:
+	 * disconnect() runs per client, so a transmitter backed by a pool pays this serially, and it only elapses when
+	 * the MQTT server is genuinely stuck. At 2 seconds a three client pool adds at most 6 seconds to a module stop.
+	 */
+	private static final long LWT_DRAIN_TIMEOUT = 2000;
+
 	private Thread connectRunnableThread;
 	private ConnectRunnable connectRunnable;
 	private long connectRetryInterval;
@@ -196,6 +203,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 * dropped a message, so it is written and read from different threads.
 	 */
 	private volatile boolean disconnectInProgress = false;
+
+	/*
+	 * IMM-5460. Set by publishLwt() so disconnect() can tell whether the death certificate actually reached the MQTT
+	 * client. False means every attempt failed, including the QoS 0 fallback - and the only remaining way to get one
+	 * published is to let the MQTT server publish the Will, which means NOT sending a DISCONNECT packet.
+	 */
+	private volatile boolean lwtPublishSucceeded = true;
 
 	private Object clientLock = new Object();
 	private ConnectionMonitorThread connectionMonitorThread;
@@ -821,6 +835,56 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
+	/**
+	 * Waits, bounded, for the publish buffer to drain.
+	 *
+	 * Called from disconnect() BEFORE the LWT is published, so the LWT can go out inline at its configured QoS and be
+	 * acknowledged rather than queued behind the backlog into a buffer that is about to be torn down.
+	 *
+	 * Deliberately NOT called from publishLwt(). That method holds {@link #lwtDeliveryLock}, and
+	 * {@link #deliveryComplete(IMqttDeliveryToken)} needs the same monitor before it can return an in-flight permit -
+	 * so waiting there would block the very mechanism that drains the buffer, and the wait could never succeed. Here
+	 * the calling thread holds only clientLock, which neither the drain thread nor deliveryComplete() takes.
+	 */
+	private void awaitPublishBufferDrained(long timeoutMillis) {
+		int depth = getPublishBufferDepth();
+		if (depth == 0) {
+			return;
+		}
+
+		logger.info("{}: Waiting up to {}ms for {} buffered publishes to drain before publishing the LWT",
+				getClientId(), timeoutMillis, depth);
+		long deadline = System.currentTimeMillis() + timeoutMillis;
+		while (System.currentTimeMillis() < deadline) {
+			if (getPublishBufferDepth() == 0) {
+				logger.debug("{}: Publish buffer drained before the LWT", getClientId());
+				return;
+			}
+			try {
+				Thread.sleep(PUBLISH_BUFFER_POLL_INTERVAL);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
+		}
+		logger.warn("{}: Publish buffer still holds {} messages after {}ms - the LWT will fall back to QoS 0, and "
+				+ "anything still queued will be discarded", getClientId(), getPublishBufferDepth(), timeoutMillis);
+	}
+
+	/*
+	 * Stops the drain thread without letting a failure abort a disconnect that is already in progress.
+	 *
+	 * Called from both arms of disconnect(): a client that was never created still has a drain thread to stop,
+	 * because connect() starts it before the Paho client is built.
+	 */
+	private void shutdownPublishBufferDrainThreadQuietly() {
+		try {
+			shutdownPublishBufferDrainThread();
+		} catch (Exception e) {
+			logger.error("{}: Failed to shutdown publish buffer drain thread", getClientId());
+		}
+	}
+
 	private void shutdownPublishBufferDrainThread() {
 		final Thread drainThread;
 		synchronized (publishOrderLock) {
@@ -1214,12 +1278,6 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			try {
-				shutdownPublishBufferDrainThread();
-			} catch (Exception e) {
-				logger.error("{}: Failed to shutdown publish buffer drain thread", getClientId());
-			}
-
-			try {
 				if (connectRunnable != null && connectRunnableThread != null) {
 					connectRunnable.stopConnectAttempts();
 					connectRunnableThread.interrupt();
@@ -1229,7 +1287,15 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			if (client != null) {
+				boolean sendDisconnectPacket = sendDisconnect;
 				try {
+					/*
+					 * IMM-5460 - give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out
+					 * inline at its configured QoS and be acknowledged. The drain thread is still running at this
+					 * point; it is stopped below, after the LWT.
+					 */
+					awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
+
 					if (publishLwt) {
 						/*
 						 * A failed LWT publish must not abort the disconnect. Only MqttException is handled below, so
@@ -1242,7 +1308,28 @@ public class TahuClient implements MqttCallbackExtended {
 							logger.error("{}: Failed to publish the LWT during disconnect - continuing",
 									getClientId(), e);
 						}
+
+						/*
+						 * IMM-5460 - last resort. Every attempt to publish the death certificate failed, the QoS 0
+						 * fallback included. A clean DISCONNECT would tell the MQTT server we left gracefully and
+						 * suppress the Will, leaving subscribers with no death certificate at all - so drop the
+						 * connection instead and let the server publish the Will it already holds from connect().
+						 */
+						if (sendDisconnectPacket && !lwtPublishSucceeded) {
+							logger.warn("{}: Could not publish the LWT on {} by any route - closing without a "
+									+ "DISCONNECT so the MQTT server publishes the Will instead", getClientId(),
+									lwtTopic);
+							sendDisconnectPacket = false;
+						}
 					}
+
+					/*
+					 * IMM-5460 - deliberately AFTER the LWT and BEFORE disconnectForcibly(). The drain thread has to
+					 * be alive for a buffered LWT to reach the MQTT server at all, and dead before the client is
+					 * closed, or it publishes into a client that is going away. It also clears the buffer, so
+					 * anything still queued at this point is discarded - see IMM-5456.
+					 */
+					shutdownPublishBufferDrainThreadQuietly();
 
 					// FIXME - remove This sleep is necessary due to:
 					// https://github.com/eclipse/paho.mqtt.java/issues/850
@@ -1252,7 +1339,7 @@ public class TahuClient implements MqttCallbackExtended {
 						Thread.currentThread().interrupt();
 					}
 					logger.debug("{}: Disconnecting...", getClientId());
-					client.disconnectForcibly(disconnectQuieseTime, disconnectTimeout, sendDisconnect);
+					client.disconnectForcibly(disconnectQuieseTime, disconnectTimeout, sendDisconnectPacket);
 					logger.debug("{}: Done disconecting", getClientId());
 					client.close();
 					logger.debug("{}: Client closed", getClientId());
@@ -1268,6 +1355,13 @@ public class TahuClient implements MqttCallbackExtended {
 				}
 			} else {
 				logger.debug("{}: Disconnect: Client is already null", getClientId());
+
+				/*
+				 * IMM-5460 - the drain thread is started by connect() before the Paho client is built, so a
+				 * disconnect with no client still has one to stop. Without this it would be orphaned - the defect
+				 * IMM-5458 describes, reached through a different door.
+				 */
+				shutdownPublishBufferDrainThreadQuietly();
 			}
 
 			// reset the timers if needed
@@ -1933,12 +2027,72 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
+	/**
+	 * Publishes the LWT at its configured QoS, falling back to QoS 0 if the acknowledged path cannot take it.
+	 *
+	 * IMM-5460. The LWT is the last thing this client sends, the publish buffer is torn down moments later, and on a
+	 * clean DISCONNECT the MQTT server suppresses the Will - so the explicit publish is the only death certificate
+	 * there will be. A buffered or rejected LWT is therefore as good as lost, where for ordinary data either outcome
+	 * is recoverable.
+	 *
+	 * The backpressure check happens BEFORE publishing, not after. {@link #publishOrBuffer(String, byte[], int,
+	 * boolean)} appends to the buffer and then returns null, so reacting to the null afterwards would leave a queued
+	 * copy behind and could deliver the LWT twice - once at QoS 0 here and once from the drain thread. Testing the
+	 * two conditions that cause buffering up front avoids that.
+	 *
+	 * A genuine failure - not connected, no client - is still rethrown so it reaches disconnect(), which is what 3.x
+	 * intended by moving the publish outside the encode handler.
+	 */
+	private IMqttDeliveryToken publishLwtWithFallback(byte[] payload) throws TahuException {
+		// The two conditions publishOrBuffer() buffers on: an exhausted in-flight window, or a non-empty buffer
+		// that this message would have to queue behind to keep ordering.
+		if (lwtQoS > MqttOperatorDefs.QOS0 && (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0)) {
+			return publishLwtAtQos0(payload);
+		}
+
+		IMqttDeliveryToken token;
+		try {
+			token = publish(lwtTopic, payload, lwtQoS, lwtRetain);
+		} catch (TahuException e) {
+			token = publishLwtAtQos0(payload);
+			if (token == null) {
+				throw e;
+			}
+			return token;
+		}
+
+		// Belt and braces for the race the check above cannot close: a permit can be taken, or the buffer filled,
+		// between the check and the publish. Rare, and a duplicate retained death certificate is harmless.
+		return token != null ? token : publishLwtAtQos0(payload);
+	}
+
+	/*
+	 * Republishes the LWT at QoS 0. QoS 0 needs no in-flight permit and is never buffered, so it can still leave the
+	 * process when the acknowledged path cannot. The acknowledgement is given up in exchange, which is the right
+	 * trade for a retained message - a subscriber that connects later still reads it from the MQTT server.
+	 */
+	private IMqttDeliveryToken publishLwtAtQos0(byte[] payload) {
+		logger.warn("{}: LWT on {} cannot be published at QoS {} - the in-flight window is exhausted or the publish "
+				+ "buffer is in use. Retrying at QoS 0 so the death certificate is not lost.", getClientId(), lwtTopic,
+				lwtQoS);
+		try {
+			return publish(lwtTopic, payload, MqttOperatorDefs.QOS0, lwtRetain);
+		} catch (Exception e) {
+			logger.error("{}: Failed to publish the LWT on {} at QoS 0", getClientId(), lwtTopic, e);
+			return null;
+		}
+	}
+
 	public void publishLwt(boolean waitForLwt) throws MqttException, TahuException {
 		synchronized (clientLock) {
 			boolean clientConnected = client != null && client.isConnected();
 			boolean lwtDeliveryComplete = false;
+			// Nothing attempted yet means nothing for disconnect() to escalate over
+			lwtPublishSucceeded = true;
 			if (lwtTopic != null && clientConnected) {
 				boolean lwtPublished = false;
+				// Flipped back to true below only if the message actually reaches the MQTT client
+				lwtPublishSucceeded = false;
 				synchronized (lwtDeliveryLock) {
 					/*
 					 * Synchronization with the deliveryComplete() callback is needed to ensure that
@@ -1963,16 +2117,17 @@ public class TahuClient implements MqttCallbackExtended {
 						 * Deliberately outside the encode handler above so a failed publish reaches the caller rather
 						 * than being logged and swallowed.
 						 */
-						lwtDeliveryToken = publish(lwtTopic, payload, lwtQoS, lwtRetain);
+						lwtDeliveryToken = publishLwtWithFallback(payload);
 					} else {
 						logger.debug("{}: Publishing LWT on {} with qos={} and retain={}", getClientId(), lwtTopic,
 								lwtQoS, lwtRetain);
-						lwtDeliveryToken = publish(lwtTopic, lwtPayload, lwtQoS, lwtRetain);
+						lwtDeliveryToken = publishLwtWithFallback(lwtPayload);
 					}
 					if (lwtDeliveryToken != null) {
 						logger.debug("{}: published on LWT Topic={}, messageId={}", getClientId(), lwtTopic,
 								lwtDeliveryToken.getMessageId());
 						lwtPublished = true;
+						lwtPublishSucceeded = true;
 					} else {
 						logger.warn("Failed to publish LWT {}", lwtTopic);
 					}
