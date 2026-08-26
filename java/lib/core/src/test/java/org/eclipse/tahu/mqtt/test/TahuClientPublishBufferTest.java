@@ -177,7 +177,16 @@ public class TahuClientPublishBufferTest {
 		Assert.assertEquals(fakeClient.publishedTopics(), List.of("topic/qos0"));
 	}
 
-	/** Buffered QoS > 0 messages must come out of the drain in exactly publish order. */
+	/**
+	 * Buffered QoS > 0 messages come out of the drain in publish order while every send succeeds.
+	 *
+	 * This asserts the happy path only, and deliberately so: FIFO here is best effort, not a guarantee. It is not held
+	 * across a failed send - publishOrderLock is released between the failure and the re-queue, so a concurrent
+	 * publisher can go inline ahead of the message going back to the head. That gap is accepted rather than fixed
+	 * (MQTT does not order across an in-flight window greater than one either, and Sparkplug sequence-bearing traffic
+	 * publishes at QoS 0 and never reaches this buffer), so do not tighten this test into a guarantee the class does
+	 * not make.
+	 */
 	@Test(
 			timeOut = TIMEOUT_MS)
 	public void drainPreservesPublishOrderOfBufferedMessages() throws Exception {
@@ -316,7 +325,13 @@ public class TahuClientPublishBufferTest {
 		Assert.assertEquals(availablePermits(), 8, "Every permit taken for a failed send must be returned");
 	}
 
-	/** A message that fails once then succeeds must still be delivered, and in its original position. */
+	/**
+	 * A message that fails once then succeeds must still be delivered, ahead of what is still queued behind it.
+	 *
+	 * Single-threaded on purpose. It proves the re-queue goes to the head rather than the tail; it does NOT prove the
+	 * message keeps its place against a concurrent publisher, which it would not - see
+	 * {@link #drainPreservesPublishOrderOfBufferedMessages()} for why that gap is accepted.
+	 */
 	@Test(
 			timeOut = TIMEOUT_MS)
 	public void requeuedMessageKeepsItsPlaceInLine() throws Exception {

@@ -137,8 +137,12 @@ public class TahuClient implements MqttCallbackExtended {
 	 * A QoS > 0 publish needs an in-flight permit, and permits are only returned by deliveryComplete() when the MQTT
 	 * server ACKs a message. Rather than waiting for one - which is what deadlocked this client against
 	 * deliveryComplete() - a message that cannot get a permit immediately is buffered and sent by the drain thread once
-	 * a permit frees up. Once anything is buffered, every subsequent QoS > 0 message is buffered too, so ordering among
-	 * them is preserved.
+	 * a permit frees up. Once anything is buffered, every subsequent QoS > 0 message is buffered too, so they leave the
+	 * buffer in submission order on the happy path.
+	 *
+	 * That ordering is BEST EFFORT and is not a guarantee. See publishOrderLock below for where it does not hold, and
+	 * note that MQTT itself only orders messages when at most one is in flight - with maxInFlightMessages in the
+	 * thousands, acknowledged messages can already be reordered on the wire regardless of anything this class does.
 	 *
 	 * QoS 0 is never buffered - it needs no permit and is always published immediately, so it can overtake buffered
 	 * QoS > 0 messages during a stall.
@@ -152,7 +156,15 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * The FIFO publish buffer, the lock guarding both it and publish ordering, and the thread that drains it.
 	 *
-	 * publishOrderLock guards the decision "publish now or queue" so that no message can overtake one already queued.
+	 * publishOrderLock guards the decision "publish now or queue" so that, in normal operation, no message overtakes one
+	 * already queued.
+	 *
+	 * KNOWN GAP, accepted deliberately: when a buffered send fails, the lock is released between the failed publish and
+	 * the requeueOrDrop() that puts the message back at the head, so a concurrent publisher can see an empty buffer and
+	 * go inline ahead of it. Ordering is therefore best effort, not guaranteed. This is accepted rather than fixed
+	 * because MQTT provides no ordering guarantee across an in-flight window greater than one anyway, and the callers
+	 * that care about sequence - Sparkplug NDATA/DDATA - publish at QoS 0 and never enter this buffer.
+	 *
 	 * Lock order is always publishOrderLock -> messageLock; deliveryComplete() takes messageLock only, so there is no
 	 * cycle and permits can always be returned.
 	 */
@@ -578,9 +590,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 * against {@link #deliveryComplete(IMqttDeliveryToken)} - a message that cannot get a permit immediately is
 	 * appended to the publish buffer and sent later by the drain thread.
 	 *
-	 * Once the buffer is non-empty every subsequent QoS > 0 message is appended to it until it drains, so ordering
-	 * among acknowledged messages is preserved. QoS 0 is never buffered - it takes no permit and is always sent
-	 * immediately, so it may overtake queued QoS > 0 messages while the in-flight window is exhausted.
+	 * Once the buffer is non-empty every subsequent QoS > 0 message is appended to it until it drains, so buffered
+	 * messages are sent in submission order while sends keep succeeding. That ordering is BEST EFFORT: it is not held
+	 * across a failed send, and MQTT does not order messages across an in-flight window greater than one in any case.
+	 * Callers that need a strict sequence must carry it in the payload.
+	 *
+	 * QoS 0 is never buffered - it takes no permit and is always sent immediately, so it may overtake queued QoS > 0
+	 * messages while the in-flight window is exhausted.
 	 *
 	 * @return the delivery token if the message was published inline, or <b>null</b> if it was buffered. A null return
 	 *         means the message is queued, not lost - callers must not treat it as a failure.
@@ -607,7 +623,8 @@ public class TahuClient implements MqttCallbackExtended {
 	/**
 	 * Decides - atomically with respect to the buffer - whether a message is published now or queued.
 	 *
-	 * The whole decision runs under {@link #publishOrderLock} so that no message can overtake one already queued. It
+	 * The whole decision runs under {@link #publishOrderLock} so that a message cannot overtake one already queued -
+	 * except across a failed buffered send, which that field documents as an accepted gap. It
 	 * NEVER waits for a permit while holding a lock: the inline path uses a non-blocking {@link Semaphore#tryAcquire()}
 	 * and falls back to buffering. That is what keeps {@link #deliveryComplete(IMqttDeliveryToken)} - which needs only
 	 * {@link #messageLock} - able to return permits at all times.
@@ -813,6 +830,10 @@ public class TahuClient implements MqttCallbackExtended {
 	/**
 	 * Puts a failed send back at the head of the buffer, or drops it once it has used up its attempts.
 	 *
+	 * NOTE: the caller has already left the publishOrderLock block by the time this runs, so a concurrent publisher can
+	 * slip in ahead of the message being re-queued. That reordering is an accepted gap - see publishOrderLock - so "back
+	 * at the head" means ahead of everything still queued, not ahead of everything published after the failure.
+	 *
 	 * Paho does not rescue this message. Its QoS 1/2 redelivery only covers messages already accepted into its
 	 * outbound queue and persistence, and a throw from its publish() means this one never got that far. If it is not
 	 * re-queued here it is gone.
@@ -843,7 +864,8 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	/*
-	 * Drains the publish buffer in FIFO order as in-flight permits become available.
+	 * Drains the publish buffer head first as in-flight permits become available. FIFO on the happy path only - a failed
+	 * send can be overtaken while it is re-queued, which publishOrderLock documents as an accepted gap.
 	 *
 	 * Permits are acquired WITHOUT holding publishOrderLock - only the dequeue-and-publish step takes it - so this
 	 * thread can never block a caller or deliveryComplete().
