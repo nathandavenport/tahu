@@ -280,6 +280,8 @@ public class TahuClientPublishBufferTest {
 		}
 
 		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 3, "A rejected publish must not be buffered");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
+				"A capacity rejection must be counted so the loss is visible to an operator");
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
@@ -307,10 +309,17 @@ public class TahuClientPublishBufferTest {
 		Assert.assertEquals(availablePermits(), 4, "A failed inline send must return its permit");
 	}
 
-	/** A buffered message that fails is retried, then dropped once its attempts are exhausted. */
+	/**
+	 * A buffered message that keeps failing is retried across a window of wall clock, then dropped and counted.
+	 *
+	 * The budget is time, not attempts, and that distinction is the whole point. Nothing on the failure path delays -
+	 * the buffer is non-empty so the drain's wait() is skipped, the client still reports connected so its poll sleep
+	 * is skipped, and tryAcquire() returns at once because the failed send released its permit - so a pure attempt
+	 * count was consumed in about two milliseconds and gave a transient failure no chance to clear.
+	 */
 	@Test(
-			timeOut = TIMEOUT_MS)
-	public void bufferedSendFailureIsRetriedThenDropped() throws Exception {
+			timeOut = TIMEOUT_MS * 3)
+	public void bufferedSendFailureIsRetriedAcrossTheWindowThenDroppedAndCounted() throws Exception {
 		wire(0, 8);
 
 		tahuClient.publish("topic/poison", "x".getBytes(), 1, false);
@@ -320,9 +329,17 @@ public class TahuClientPublishBufferTest {
 		startDrain();
 		releasePermits(8);
 
-		awaitBufferDepth(0);
-		Assert.assertEquals(fakeClient.publishAttempts(), 3, "Should stop after MAX_BUFFERED_PUBLISH_ATTEMPTS");
+		long start = System.currentTimeMillis();
+		awaitBufferDepth(0, TIMEOUT_MS * 2);
+		long elapsed = System.currentTimeMillis() - start;
+
+		Assert.assertTrue(elapsed >= 500,
+				"The retry budget must span wall clock, not iterations - dropped after only " + elapsed + "ms");
+		Assert.assertTrue(fakeClient.publishAttempts() >= 3,
+				"The window should still afford about three attempts, made " + fakeClient.publishAttempts());
 		Assert.assertEquals(availablePermits(), 8, "Every permit taken for a failed send must be returned");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
+				"A dropped message is lost data and must be counted - publish() told the caller it was queued");
 	}
 
 	/**
@@ -583,6 +600,49 @@ public class TahuClientPublishBufferTest {
 		Assert.assertTrue(fakeClient.disconnectSent, "No LWT configured is not a failure to publish one");
 	}
 
+	/**
+	 * Nothing buffered before a disconnect may be published on the next session.
+	 *
+	 * The guarantee is real but indirect: connect() clears nothing itself, it relies on calling disconnect() first,
+	 * and disconnect() clears the buffer only as a side effect of stopping the drain thread. Since
+	 * startPublishBufferDrainThread() returns early when a drain already exists, any future path that reached
+	 * connect() without a disconnect would carry the old buffer and its live drain thread straight into the new
+	 * session and replay stale messages against it. This pins the invariant at the disconnect boundary.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void bufferedMessagesAreNotReplayedOnTheNextSession() throws Exception {
+		wire(0, 8);
+		startDrain();
+		for (int i = 0; i < 5; i++) {
+			tahuClient.publish("topic/stale-" + i, "x".getBytes(), 1, false);
+		}
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 5, "Precondition: the messages are queued");
+		Object drainBeforeDisconnect = get(tahuClient, "publishBufferDrain");
+		Assert.assertNotNull(drainBeforeDisconnect, "Precondition: a drain thread owns that buffer");
+
+		tahuClient.disconnect(0, 1, false, false, false);
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0, "The disconnect must leave nothing queued");
+		Assert.assertNull(get(tahuClient, "publishBufferDrain"), "The drain that owned the old buffer must be gone");
+
+		// Stand in for the next connect(): the server is up, permits are restored and the drain is restarted,
+		// exactly as connect() does. The session has to be live or the drain would decline to publish anyway and
+		// the assertion below would prove nothing.
+		fakeClient.markConnected();
+		wire(8, 8);
+		startDrain();
+		Assert.assertNotSame(get(tahuClient, "publishBufferDrain"), drainBeforeDisconnect,
+				"The new session must get a new drain, not the one still holding the old buffer");
+
+		// Give the new drain longer than its poll interval to publish anything it might still be holding
+		Thread.sleep(DRAIN_POLL_MS * 3);
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0);
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"No message queued before the disconnect may reach the MQTT server on the next session");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Harness
 	// ------------------------------------------------------------------------------------------------------------
@@ -727,6 +787,11 @@ public class TahuClientPublishBufferTest {
 			if (executor != null) {
 				executor.shutdownNow();
 			}
+		}
+
+		/* Brings the fake back up, so a test can model a genuinely live next session. */
+		private void markConnected() {
+			connected.set(true);
 		}
 
 		private void failNextPublishes(int count) {

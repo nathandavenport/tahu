@@ -59,7 +59,27 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final long DEFAULT_CONNECT_ATTEMPT_TIMEOUT = 30000;
 	private static final int DEFAULT_PUBLISH_BUFFER_CAPACITY = 10000;
 	private static final long PUBLISH_BUFFER_POLL_INTERVAL = 250;
-	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 3;
+	/*
+	 * The retry budget for a buffered publish that fails to send, as a window of wall clock rather than a count of
+	 * attempts. The failures worth retrying - REASON_CODE_MAX_INFLIGHT when Tahu's permit count has drifted above
+	 * Paho's window, REASON_CODE_CLIENT_NOT_CONNECTED across a brief drop - are transient and clear on their own, so
+	 * the budget only means anything if it spans time. An attempt count alone did not: nothing on the failure path
+	 * delays, so three attempts were consumed in about two milliseconds and a blip destroyed the message.
+	 *
+	 * The window is deliberately short, because it is calibrated to a race and not to an outage. 32202 is thrown when
+	 * Tahu's permit count is ahead of Paho's actualInFlight, and the two go back into step as soon as Paho finishes
+	 * the acknowledgement it is already processing - microseconds, not seconds. Where the drift is structural rather
+	 * than a race the condition never clears on its own, and where the client is simply not connected the drain's own
+	 * isConnected() check handles it on the next pass; in neither case does a longer window help, it only holds up
+	 * everything else in the buffer, because the backoff sleeps the drain thread. At 500ms a message gets three
+	 * attempts spread over roughly 750ms of wall clock.
+	 *
+	 * MAX_BUFFERED_PUBLISH_ATTEMPTS remains as a backstop against a message that fails instantly in a tight loop
+	 * filling the log; the window is what normally decides.
+	 */
+	private static final long MAX_BUFFERED_PUBLISH_RETRY_WINDOW = 500;
+	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 10;
+	private static final long MAX_BUFFERED_PUBLISH_RETRY_DELAY = 500;
 
 	/*
 	 * How long disconnect() will wait for the publish buffer to drain before publishing the LWT. Short on purpose:
@@ -787,10 +807,18 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	/**
-	 * @return the number of publishes rejected because the publish buffer was full, for the life of this client. Any
-	 *         non-zero value means the MQTT server stalled for longer than the buffer could absorb. Whether those
-	 *         messages were then lost or stored depends on the caller - {@link #publish(String, byte[], int, boolean)}
-	 *         throws on rejection so the caller can fall back to its own store and forward.
+	 * @return the number of publishes this client did not send, for the life of this client. Any non-zero value means
+	 *         the MQTT server stalled for longer than the buffer could absorb. Two routes reach this counter, and what
+	 *         the caller can do about the loss differs between them:
+	 *         <ul>
+	 *         <li>a capacity rejection, where {@link #publish(String, byte[], int, boolean)} throws so the caller can
+	 *         fall back to its own store and forward;</li>
+	 *         <li>a buffered message dropped once its retry window is spent - see requeueOrDrop(). That message is
+	 *         lost: publish() returned null, so the caller was told it was queued and has no other way to learn
+	 *         otherwise.</li>
+	 *         </ul>
+	 *         Not every loss is counted here. The buffer clear() in shutdownPublishBufferDrainThread() discards
+	 *         whatever is still queued at disconnect without counting it - IMM-5456.
 	 */
 	public long getPublishBufferRejectedMessageCount() {
 		synchronized (publishOrderLock) {
@@ -812,6 +840,9 @@ public class TahuClient implements MqttCallbackExtended {
 		 * message never entered its outbound queue or persistence, so nothing else will resend it.
 		 */
 		private int attempts;
+
+		/* When this message first failed to send, so the retry budget can be measured in wall clock. */
+		private long firstFailureTime;
 
 		private BufferedPublish(String topic, byte[] payload, int qos, boolean retained) {
 			this.topic = topic;
@@ -907,38 +938,54 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	/**
-	 * Puts a failed send back at the head of the buffer, or drops it once it has used up its attempts.
-	 *
-	 * NOTE: the caller has already left the publishOrderLock block by the time this runs, so a concurrent publisher can
-	 * slip in ahead of the message being re-queued. That reordering is an accepted gap - see publishOrderLock - so "back
-	 * at the head" means ahead of everything still queued, not ahead of everything published after the failure.
+	 * Puts a failed send back at the head of the buffer, or drops it once its retry budget is spent.
 	 *
 	 * Paho does not rescue this message. Its QoS 1/2 redelivery only covers messages already accepted into its
 	 * outbound queue and persistence, and a throw from its publish() means this one never got that far. If it is not
 	 * re-queued here it is gone.
 	 *
-	 * The realistic failures are transient and clear on their own - REASON_CODE_MAX_INFLIGHT (32202) when Tahu's
-	 * permit count has drifted above Paho's window, or REASON_CODE_CLIENT_NOT_CONNECTED (32104) if the connection drops
-	 * between the check and the send - so a first failure is not a reason to discard data.
+	 * The budget is a window of wall clock, not a count of attempts. The realistic failures - REASON_CODE_MAX_INFLIGHT
+	 * (32202) when Tahu's permit count has drifted above Paho's window, or REASON_CODE_CLIENT_NOT_CONNECTED (32104) if
+	 * the connection drops between the check and the send - are transient and clear on their own, which a count alone
+	 * gave them no time to do.
 	 *
-	 * Attempts are bounded because a message that can never be sent would otherwise sit at the head forever and block
-	 * everything queued behind it.
+	 * NOTE: the caller has already left the publishOrderLock block by the time this runs, so a concurrent publisher can
+	 * slip in ahead of the message being re-queued. That reordering is an accepted gap - see publishOrderLock - so
+	 * "back at the head" means ahead of everything still queued, not ahead of everything published after the failure.
+	 *
+	 * @return how long the caller should wait before the next attempt, or 0 if the message was dropped. The caller
+	 *         must do the waiting: this method holds publishOrderLock, and sleeping here would block every publisher
+	 *         on this client for the duration of the backoff.
 	 */
-	private void requeueOrDrop(BufferedPublish attempted, Throwable cause) {
+	private long requeueOrDrop(BufferedPublish attempted, Throwable cause) {
 		if (attempted == null) {
-			return;
+			return 0;
 		}
 
 		synchronized (publishOrderLock) {
-			attempted.attempts++;
-			if (attempted.attempts < MAX_BUFFERED_PUBLISH_ATTEMPTS) {
-				publishBuffer.addFirst(attempted);
-				logger.warn("{}: Failed to send buffered publish on {} - re-queued at head, attempt {} of {}",
-						getClientId(), attempted.topic, attempted.attempts, MAX_BUFFERED_PUBLISH_ATTEMPTS, cause);
-			} else {
-				logger.error("{}: Dropping buffered publish on {} after {} failed attempts", getClientId(),
-						attempted.topic, attempted.attempts, cause);
+			long now = System.currentTimeMillis();
+			if (attempted.firstFailureTime == 0) {
+				attempted.firstFailureTime = now;
 			}
+			attempted.attempts++;
+			long elapsed = now - attempted.firstFailureTime;
+
+			if (elapsed < MAX_BUFFERED_PUBLISH_RETRY_WINDOW && attempted.attempts < MAX_BUFFERED_PUBLISH_ATTEMPTS) {
+				publishBuffer.addFirst(attempted);
+				long delay = Math.min(PUBLISH_BUFFER_POLL_INTERVAL * attempted.attempts,
+						MAX_BUFFERED_PUBLISH_RETRY_DELAY);
+				logger.warn("{}: Failed to send buffered publish on {} - re-queued at head, attempt {}, {}ms into a "
+						+ "{}ms window, retrying in {}ms", getClientId(), attempted.topic, attempted.attempts, elapsed,
+						MAX_BUFFERED_PUBLISH_RETRY_WINDOW, delay, cause);
+				return delay;
+			}
+
+			// Counted, not just logged: publish() returned null for this message, so the caller was told it was
+			// queued and has no other way to learn that it was not sent.
+			publishBufferRejectedMessageCount++;
+			logger.error("{}: Dropping buffered publish on {} after {} attempts over {}ms", getClientId(),
+					attempted.topic, attempted.attempts, elapsed, cause);
+			return 0;
 		}
 	}
 
@@ -987,6 +1034,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 					boolean permitOwnershipTransferred = false;
 					BufferedPublish attempted = null;
+					long retryDelay = 0;
 					try {
 						synchronized (publishOrderLock) {
 							BufferedPublish head = publishBuffer.peekFirst();
@@ -1005,11 +1053,22 @@ public class TahuClient implements MqttCallbackExtended {
 							}
 						}
 					} catch (Throwable t) {
-						requeueOrDrop(attempted, t);
+						/*
+						 * The backoff is taken here rather than inside requeueOrDrop(), which holds publishOrderLock.
+						 * It matters that something waits: after a failure every delay point in this loop is skipped -
+						 * the buffer is non-empty so wait() does not fire, the client still reports connected so the
+						 * poll sleep is not taken, and tryAcquire() returns at once because the permit the failed send
+						 * just released is free again. Without this the whole retry window is spent in microseconds.
+						 */
+						retryDelay = requeueOrDrop(attempted, t);
 					} finally {
 						if (!permitOwnershipTransferred) {
 							permitHolder.release();
 						}
+					}
+
+					if (retryDelay > 0) {
+						Thread.sleep(retryDelay);
 					}
 				} catch (InterruptedException ie) {
 					Thread.currentThread().interrupt();
