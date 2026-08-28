@@ -98,6 +98,19 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final long BUFFERING_WARN_INTERVAL = 30000;
 
 	/*
+	 * How long publishBirthMessage() will wait for backpressure to clear before it gives up on the session, and how
+	 * often it looks. An exhausted window or a queued message is the ordinary condition the publish buffer exists to
+	 * absorb and it clears on the next acknowledgement, so refusing immediately tore sessions down over a blip.
+	 *
+	 * The poll is deliberately fine grained. This runs inside synchronized (clientLock) - every caller already holds
+	 * it - and Thread.sleep() does not release a monitor, so the interval is not about contention, which is the same
+	 * either way. It is about how long the lock is held to notice something that has already resolved: at 50ms a
+	 * transient blip costs about that, where a coarser poll would hold the lock far longer to observe the same thing.
+	 */
+	private static final long BIRTH_BACKPRESSURE_WAIT = 500;
+	private static final long BIRTH_BACKPRESSURE_POLL = 50;
+
+	/*
 	 * How long disconnect() will wait for the publish buffer to drain before publishing the LWT. Short on purpose:
 	 * disconnect() runs per client, so a transmitter backed by a pool pays this serially, and it only elapses when
 	 * the MQTT server is genuinely stuck. At 2 seconds a three client pool adds at most 6 seconds to a module stop.
@@ -1045,6 +1058,32 @@ public class TahuClient implements MqttCallbackExtended {
 			publishBufferDrainThread.setDaemon(true);
 			publishBufferDrainThread.start();
 			logger.debug("{}: Started the publish buffer drain thread", getClientId());
+		}
+	}
+
+	/*
+	 * Waits, bounded, for the client to be able to publish inline again - a free in-flight permit and an empty
+	 * buffer, the two conditions publishOrBuffer() would otherwise buffer on.
+	 *
+	 * The caller holds clientLock and this does not release it, so the budget is a deliberate ceiling on how long
+	 * everything else on that lock is held up. It returns the moment the window opens, and gives up early if the
+	 * client goes away, since neither condition can clear after that.
+	 */
+	private void awaitPublishableWindow(long timeoutMillis) {
+		long deadline = System.currentTimeMillis() + timeoutMillis;
+		while (System.currentTimeMillis() < deadline) {
+			if (getAvailablePublishPermits() > 0 && getPublishBufferDepth() == 0) {
+				return;
+			}
+			if (semaphore == null || client == null || !client.isConnected()) {
+				return;
+			}
+			try {
+				Thread.sleep(BIRTH_BACKPRESSURE_POLL);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				return;
+			}
 		}
 	}
 
@@ -2335,9 +2374,19 @@ public class TahuClient implements MqttCallbackExtended {
 		synchronized (clientLock) {
 			if (birthTopic != null && client.isConnected()) {
 				try {
-					// The two conditions publishOrBuffer() buffers on. Reached from setOnlineState() mid-session,
-					// where the window can be exhausted; connect() rebuilds the semaphore before the client exists,
-					// so the connectComplete() route always finds a full window and an empty buffer.
+					/*
+					 * The two conditions publishOrBuffer() buffers on. Reached from setOnlineState() mid-session,
+					 * where the window can be exhausted; connect() rebuilds the semaphore before the client exists,
+					 * so the connectComplete() route always finds a full window and an empty buffer.
+					 *
+					 * Give it a moment first. Both conditions are the ordinary backpressure the buffer exists to
+					 * absorb and both clear on the next acknowledgement, so testing once and giving up meant a
+					 * single message queued for milliseconds cost the whole session.
+					 */
+					if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
+						awaitPublishableWindow(BIRTH_BACKPRESSURE_WAIT);
+					}
+
 					if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
 						throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
 								"MQTT client: " + clientId.getMqttClientId() + " cannot publish the BIRTH on "
@@ -2371,11 +2420,26 @@ public class TahuClient implements MqttCallbackExtended {
 						publish(birthTopic, birthPayload, MqttOperatorDefs.QOS1, birthRetain);
 					}
 				} catch (TahuException ce) {
-					// Covers both a failed publish and a BIRTH that would have been buffered: in either case no
-					// BIRTH reached the MQTT server, so the session must not be left announcing itself as online.
+					/*
+					 * Covers both a failed publish and a BIRTH that backpressure never cleared for: in either case
+					 * no BIRTH reached the MQTT server, so the session must not be left announcing itself online.
+					 *
+					 * Through disconnect() rather than a bare disconnectForcibly(), so the session is torn down by
+					 * the one path that does it completely - the drain stopped and its buffer discarded and counted,
+					 * the Paho client closed rather than leaked, the client field cleared. Dropping only the socket
+					 * left the buffer, the drain thread and a closed client behind for the next disconnect to find.
+					 *
+					 * sendDisconnect false so the MQTT server publishes the Will rather than treating this as a
+					 * graceful exit, and publishLwt false because there is no acknowledged death to send from a
+					 * session that never announced itself - the Will is the better carrier and this avoids
+					 * re-entering the LWT machinery from Paho's callback thread.
+					 *
+					 * Recovery is the caller's: the modules that own these clients poll isConnected() in their own
+					 * run loops, so it does not depend on the ConnectionMonitor this tears down.
+					 */
 					logger.error("{}: Error in birth topic publish on connect", getClientId(), ce);
 					try {
-						client.disconnectForcibly(0, 1, false);
+						disconnect(0, 1, false, false, false);
 					} catch (Exception e) {
 						logger.error("{}: Failed to disconnect after failed BIRTH publish", getClientId(), e);
 					}

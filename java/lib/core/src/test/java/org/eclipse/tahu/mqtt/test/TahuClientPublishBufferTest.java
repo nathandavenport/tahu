@@ -1044,6 +1044,69 @@ public class TahuClientPublishBufferTest {
 						+ "DISCONNECT is the correct close");
 	}
 
+	/**
+	 * Backpressure that clears must not cost the session.
+	 *
+	 * An exhausted window or a queued message is the ordinary condition the publish buffer exists to absorb, and it
+	 * clears on the next acknowledgement. Testing once and giving up meant one QoS 1 message queued for
+	 * milliseconds forcibly disconnected the client - measured: permits=0 depth=1 in, connected=false out, with the
+	 * buffer and its drain thread left live and nothing published.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void transientBackpressureDoesNotCostTheSession() throws Exception {
+		wire(0, 8);
+		configureBirth();
+		tahuClient.publish("topic/one-queued", "x".getBytes(), 1, false);
+
+		// The acknowledgement that was always going to arrive, a moment later
+		Thread releaser = new Thread(() -> {
+			try {
+				Thread.sleep(100);
+				startDrain();
+				releasePermits(8);
+			} catch (Exception e) {
+				// The assertions below report it
+			}
+		}, "late-permit");
+		releaser.setDaemon(true);
+		releaser.start();
+
+		tahuClient.setOnlineState(true);
+
+		Assert.assertTrue(fakeClient.publishedTopics().contains(BIRTH_TOPIC),
+				"The BIRTH must go out once the window opens, not tear the session down while it is closed");
+		Assert.assertFalse(fakeClient.disconnectForciblyCalled,
+				"Backpressure that clears within the budget is not a reason to drop the connection");
+	}
+
+	/**
+	 * Backpressure that does not clear still refuses the BIRTH - and tears the session down cleanly.
+	 *
+	 * The escalation used to drop the socket and leave everything else: buffer intact, drain thread still
+	 * registered, client field still pointing at a closed Paho client. That last one is why recovery took so long -
+	 * ConnectionMonitor jumps a null client straight to its trigger, where a non-null closed one counts five 10
+	 * second intervals to get there.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void persistentBackpressureRefusesTheBirthAndTearsDown() throws Exception {
+		wire(0, 8);
+		configureBirth();
+		tahuClient.publish("topic/stuck", "x".getBytes(), 1, false);
+
+		tahuClient.setOnlineState(true);
+
+		Assert.assertFalse(fakeClient.publishedTopics().contains(BIRTH_TOPIC),
+				"No BIRTH reached the MQTT server, so none may be reported as sent");
+		Assert.assertTrue(fakeClient.disconnectForciblyCalled, "The session must not be left announcing itself");
+		Assert.assertNull(get(tahuClient, "publishBufferDrain"), "The drain thread must not outlive the session");
+		Assert.assertNull(get(tahuClient, "client"), "A null client is what ConnectionMonitor recovers from fastest");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0, "The buffer must not outlive the session");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 1,
+				"What was queued is lost data and must be counted, not silently dropped");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Byte capacity
 	// ------------------------------------------------------------------------------------------------------------
