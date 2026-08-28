@@ -13,6 +13,7 @@
 
 package org.eclipse.tahu.mqtt.test;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -892,6 +893,60 @@ public class TahuClientPublishBufferTest {
 
 		Assert.assertEquals(fakeClient.publishedTopics(), List.of(BIRTH_TOPIC), "The BIRTH must go out inline");
 		Assert.assertFalse(fakeClient.disconnectForciblyCalled, "A published BIRTH is not a reason to reconnect");
+	}
+
+	/**
+	 * A drain that has been retired must not re-queue into the next session's buffer.
+	 *
+	 * publishWithPermit() throws from inside a synchronized (publishOrderLock) block that the drain's catch sits
+	 * outside of, so the monitor is released and re-acquired between the failed send and the re-queue. A disconnect
+	 * can win it in that gap: the buffer is discarded, this drain retired, and connect() starts another - and the
+	 * old drain then hands its message to the new session's drain, at the head of the queue.
+	 *
+	 * Measured before the fix, driving exactly that state: the stranded entry sat silently (no notify), then went
+	 * out first on the new session - [spBv1.0/STATE/host-1, spBv1.0/G1/NDATA/E1]. A retained STATE online:false
+	 * with the previous session's timestamp, landing on a live session ahead of its BIRTH.
+	 *
+	 * Driven directly rather than by racing the two threads: the window is real but narrow - 2 hits in 400
+	 * iterations - and a test that reproduces it 0.5% of the time guards nothing.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aRetiredDrainDoesNotRequeueIntoTheNextSession() throws Exception {
+		wire(0, 8);
+		tahuClient.publish("topic/old-session", "x".getBytes(), 1, false);
+
+		// What the drain still holds on its stack when publishWithPermit() throws
+		Class<?> bufferedPublishClass = Class.forName("org.eclipse.tahu.mqtt.TahuClient$BufferedPublish");
+		Constructor<?> ctor =
+				bufferedPublishClass.getDeclaredConstructor(String.class, byte[].class, int.class, boolean.class);
+		ctor.setAccessible(true);
+		Object attempted = ctor.newInstance(LWT_TOPIC, "death".getBytes(), 1, true);
+		Object retiredDrain = get(tahuClient, "publishBufferDrain");
+
+		// The disconnect that wins the monitor in the gap, then the next session
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+		fakeClient.markConnected();
+		wire(8, 8);
+		Assert.assertNotSame(get(tahuClient, "publishBufferDrain"), retiredDrain,
+				"Precondition: the new session has a different drain");
+		long discardedBefore = tahuClient.getPublishBufferDiscardedMessageCount();
+
+		Method requeueOrDrop = TahuClient.class.getDeclaredMethod("requeueOrDrop", bufferedPublishClass,
+				Throwable.class, Class.forName("org.eclipse.tahu.mqtt.TahuClient$PublishBufferDrain"));
+		requeueOrDrop.setAccessible(true);
+		Object delay = requeueOrDrop.invoke(tahuClient, attempted, new RuntimeException("send failed"), retiredDrain);
+
+		Assert.assertEquals(delay, 0L, "A retired drain must be told to stop retrying, not to wait and try again");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0,
+				"A dead session's message must not be queued for the next one");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), discardedBefore + 1,
+				"The message is lost data and must be counted, not dropped quietly");
+
+		tahuClient.publish("spBv1.0/G1/NDATA/E1", "live".getBytes(), 1, false);
+		awaitBufferDepth(0);
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of("spBv1.0/G1/NDATA/E1"),
+				"Only the new session's own traffic may reach the MQTT server");
 	}
 
 	// ------------------------------------------------------------------------------------------------------------

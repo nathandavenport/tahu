@@ -1019,6 +1019,19 @@ public class TahuClient implements MqttCallbackExtended {
 			if (publishBufferDrain != null) {
 				return;
 			}
+
+			/*
+			 * A new session never inherits queued messages. disconnect() is supposed to have discarded them, and
+			 * this does not trust that it did - any teardown path that skipped it, or anything that reached the
+			 * buffer after it ran, would otherwise be replayed here on a connection it was not addressed to.
+			 */
+			if (!publishBuffer.isEmpty()) {
+				publishBufferDiscardedMessageCount += publishBuffer.size();
+				logger.warn("{}: Discarding {} buffered publishes left from a previous session", getClientId(),
+						publishBuffer.size());
+				bufferClear();
+			}
+
 			publishBufferDrain = new PublishBufferDrain();
 			publishBufferDrainThread = new Thread(publishBufferDrain,
 					"TahuPublishBufferDrain-" + getClientId().getMqttClientId());
@@ -1134,16 +1147,33 @@ public class TahuClient implements MqttCallbackExtended {
 	 * slip in ahead of the message being re-queued. That reordering is an accepted gap - see publishOrderLock - so
 	 * "back at the head" means ahead of everything still queued, not ahead of everything published after the failure.
 	 *
+	 * The drain is passed in so this can refuse to re-queue into a buffer it no longer owns. publishWithPermit()
+	 * throws from inside a synchronized (publishOrderLock) block that the caller's catch sits outside of, so the
+	 * monitor is released and re-acquired between the failed send and the re-queue - and a disconnect can win it in
+	 * that gap, discard the buffer, retire this drain and let connect() start another. Putting the message back then
+	 * hands a dead session's publish to the next session's drain, at the head of its queue, which is the replay
+	 * c70d86f set out to make impossible. A null check on the field is not enough: by that point it is non-null and
+	 * pointing at a different drain.
+	 *
 	 * @return how long the caller should wait before the next attempt, or 0 if the message was dropped. The caller
 	 *         must do the waiting: this method holds publishOrderLock, and sleeping here would block every publisher
 	 *         on this client for the duration of the backoff.
 	 */
-	private long requeueOrDrop(BufferedPublish attempted, Throwable cause) {
+	private long requeueOrDrop(BufferedPublish attempted, Throwable cause, PublishBufferDrain drain) {
 		if (attempted == null) {
 			return 0;
 		}
 
 		synchronized (publishOrderLock) {
+			if (drain != publishBufferDrain || !drain.keepRunning) {
+				// Counted as a discard, not a rejection: publish() returned null for this message long ago
+				publishBufferDiscardedMessageCount++;
+				logger.warn("{}: Discarding a buffered publish on {} - its session ended while the send was being "
+						+ "retried, and it must not be replayed on the next one", getClientId(), attempted.topic,
+						cause);
+				return 0;
+			}
+
 			long now = System.currentTimeMillis();
 			if (attempted.firstFailureTime == 0) {
 				attempted.firstFailureTime = now;
@@ -1153,6 +1183,9 @@ public class TahuClient implements MqttCallbackExtended {
 
 			if (elapsed < MAX_BUFFERED_PUBLISH_RETRY_WINDOW && attempted.attempts < MAX_BUFFERED_PUBLISH_ATTEMPTS) {
 				bufferAddFirst(attempted);
+				// Every other write to the buffer notifies; this one did not, so a re-queued message could sit
+				// unnoticed until some later publish happened to wake the drain
+				publishOrderLock.notifyAll();
 				long delay = Math.min(PUBLISH_BUFFER_POLL_INTERVAL * attempted.attempts,
 						MAX_BUFFERED_PUBLISH_RETRY_DELAY);
 				logger.warn("{}: Failed to send buffered publish on {} - re-queued at head, attempt {}, {}ms into a "
@@ -1244,7 +1277,7 @@ public class TahuClient implements MqttCallbackExtended {
 						 * poll sleep is not taken, and tryAcquire() returns at once because the permit the failed send
 						 * just released is free again. Without this the whole retry window is spent in microseconds.
 						 */
-						retryDelay = requeueOrDrop(attempted, t);
+						retryDelay = requeueOrDrop(attempted, t, this);
 					} finally {
 						if (!permitOwnershipTransferred) {
 							permitHolder.release();
