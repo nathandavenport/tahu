@@ -949,6 +949,59 @@ public class TahuClientPublishBufferTest {
 				"Only the new session's own traffic may reach the MQTT server");
 	}
 
+	/**
+	 * The pre-LWT drain wait must give up as soon as it cannot succeed.
+	 *
+	 * The drain declines to publish while the client is disconnected, so with the socket down the buffer cannot
+	 * empty and the poll ran to its full deadline - then publishLwt() skipped the LWT anyway, because the client was
+	 * not connected. That is the state after a server stalls and drops the link, which is exactly the state
+	 * connect() disconnects from before every reconnect attempt, and all of it is spent holding clientLock.
+	 *
+	 * Measured: 2009ms of dead time with nothing published, against 1ms once the wait checks.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theLwtDrainWaitGivesUpWhenTheClientCannotPublish() throws Exception {
+		wire(0, 8);
+		for (int i = 0; i < 3; i++) {
+			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
+		}
+		fakeClient.markDisconnected();
+
+		Method await = TahuClient.class.getDeclaredMethod("awaitPublishBufferDrained", long.class);
+		await.setAccessible(true);
+		long start = System.currentTimeMillis();
+		await.invoke(tahuClient, 2000L);
+		long elapsed = System.currentTimeMillis() - start;
+
+		Assert.assertTrue(elapsed < 500, "Waited " + elapsed + "ms for a buffer that cannot drain - the drain will "
+				+ "not publish while the client is disconnected, so this wait can only ever reach its deadline");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 3, "Precondition: nothing could have drained");
+	}
+
+	/**
+	 * A disconnect that publishes no LWT has nothing to wait for.
+	 *
+	 * The wait sat above the publishLwt guard, so a caller passing false paid it too - EdgeClient does exactly that.
+	 * Measured through a full disconnect() with a stuck buffer: 3012ms before, 1001ms after, the residue being the
+	 * unconditional Paho workaround sleep that is not part of this change.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 2)
+	public void aDisconnectWithNoLwtDoesNotWaitForTheBuffer() throws Exception {
+		wire(0, 8);
+		for (int i = 0; i < 3; i++) {
+			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
+		}
+
+		long start = System.currentTimeMillis();
+		tahuClient.disconnect(0, 1, false, false, false);
+		long elapsed = System.currentTimeMillis() - start;
+
+		Assert.assertTrue(elapsed < 2000, "A disconnect that publishes no LWT waited " + elapsed + "ms for a buffer "
+				+ "it has no reason to drain");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Byte capacity
 	// ------------------------------------------------------------------------------------------------------------
@@ -1262,6 +1315,10 @@ public class TahuClientPublishBufferTest {
 		/* Brings the fake back up, so a test can model a genuinely live next session. */
 		private void markConnected() {
 			connected.set(true);
+		}
+
+		private void markDisconnected() {
+			connected.set(false);
 		}
 
 		/* Holds each send open, so a test can observe what a caller sees while the drain is mid-publish. */

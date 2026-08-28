@@ -1066,6 +1066,14 @@ public class TahuClient implements MqttCallbackExtended {
 				logger.debug("{}: Publish buffer drained before the LWT", getClientId());
 				return;
 			}
+
+			// The same conditions the drain refuses to publish under - waiting past them cannot achieve anything,
+			// and every millisecond here is spent holding clientLock
+			if (semaphore == null || client == null || !client.isConnected()) {
+				logger.debug("{}: Stopped waiting for the publish buffer - the client can no longer publish",
+						getClientId());
+				return;
+			}
 			try {
 				Thread.sleep(PUBLISH_BUFFER_POLL_INTERVAL);
 			} catch (InterruptedException e) {
@@ -1565,14 +1573,24 @@ public class TahuClient implements MqttCallbackExtended {
 			if (client != null) {
 				boolean sendDisconnectPacket = sendDisconnect;
 				try {
-					/*
-					 * IMM-5460 - give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out
-					 * inline at its configured QoS and be acknowledged. The drain thread is still running at this
-					 * point; it is stopped below, after the LWT.
-					 */
-					awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
-
 					if (publishLwt) {
+						/*
+						 * IMM-5460 - give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out
+						 * inline at its configured QoS and be acknowledged. The drain thread is still running at this
+						 * point; it is stopped below, after the LWT.
+						 *
+						 * Only when there is an LWT to protect, and only when the client could still send it. This
+						 * used to run on every disconnect: for a caller passing publishLwt=false there was nothing
+						 * to wait for, and with the socket already down the wait could not succeed at all - the
+						 * drain declines to publish while the client is disconnected, so the poll ran to the
+						 * deadline and publishLwt() then skipped the LWT anyway. Measured at 2011ms of dead time
+						 * with nothing published, all of it holding clientLock, on the path connect() takes before
+						 * every reconnect attempt.
+						 */
+						if (client.isConnected()) {
+							awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
+						}
+
 						/*
 						 * A failed LWT publish must not abort the disconnect. Only MqttException is handled below, so
 						 * letting a TahuException out here would skip disconnectForcibly() and close() while the
