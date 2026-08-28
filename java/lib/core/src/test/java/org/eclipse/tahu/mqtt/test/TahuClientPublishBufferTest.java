@@ -19,6 +19,7 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
 import org.eclipse.paho.client.mqttv3.IMqttAsyncClient;
@@ -63,7 +64,25 @@ public class TahuClientPublishBufferTest {
 	@AfterMethod
 	public void tearDown() throws Exception {
 		if (tahuClient != null) {
-			invoke(tahuClient, "shutdownPublishBufferDrainThread");
+			/*
+			 * Bounded, because the shutdown needs publishOrderLock and a deadlock regression is exactly the state
+			 * where nobody can have it. Left unbounded, a client wedged the way IMM-5395 wedged it would hang the
+			 * JVM here and the run would die by CI timeout with no failing test named. This turns that into a
+			 * teardown failure that says which test wedged the client.
+			 */
+			Thread shutdown = new Thread(() -> {
+				try {
+					invoke(tahuClient, "shutdownPublishBufferDrainThread");
+				} catch (Exception e) {
+					// Reported by the join below if it matters
+				}
+			}, "test-teardown");
+			shutdown.setDaemon(true);
+			shutdown.start();
+			shutdown.join(2000);
+			Assert.assertFalse(shutdown.isAlive(),
+					"The client could not be shut down - something is holding publishOrderLock, which is what a "
+							+ "deadlock regression looks like from here");
 		}
 		if (fakeClient != null) {
 			fakeClient.shutdownAckThread();
@@ -106,7 +125,29 @@ public class TahuClientPublishBufferTest {
 
 		IMqttDeliveryToken token = tahuClient.publish("topic/a", "a".getBytes(), 1, false);
 		Assert.assertNotNull(token, "First publish should go inline while a permit is free");
-		Assert.assertEquals(availablePermits(), 0);
+		Assert.assertEquals(availablePermits(), 0, "Precondition: the in-flight window is now exhausted");
+
+		/*
+		 * A second publisher meeting the exhausted window. This is the state that deadlocked: the old code took
+		 * messageLock and then blocked in semaphore.acquire() inside it, so the publisher held the monitor
+		 * deliveryComplete() needs to hand a permit back, and neither could proceed. It must now return instead -
+		 * buffered, with a null token - without holding anything deliveryComplete() needs.
+		 */
+		final CountDownLatch publisherEntered = new CountDownLatch(1);
+		final CountDownLatch publisherReturned = new CountDownLatch(1);
+		final AtomicReference<Object> publisherResult = new AtomicReference<>();
+		Thread publisherThread = new Thread(() -> {
+			publisherEntered.countDown();
+			try {
+				publisherResult.set(tahuClient.publish("topic/blocked", "b".getBytes(), 1, false));
+			} catch (Throwable t) {
+				publisherResult.set(t);
+			}
+			publisherReturned.countDown();
+		}, "fake-publisher");
+		publisherThread.setDaemon(true);
+		publisherThread.start();
+		Assert.assertTrue(publisherEntered.await(2, TimeUnit.SECONDS), "Publisher thread never started");
 
 		// The Paho callback thread returning the permit - this is the call that used to block forever
 		final CountDownLatch done = new CountDownLatch(1);
@@ -117,8 +158,20 @@ public class TahuClientPublishBufferTest {
 		callbackThread.setDaemon(true);
 		callbackThread.start();
 
-		Assert.assertTrue(done.await(2, TimeUnit.SECONDS), "deliveryComplete() blocked - the deadlock has returned");
-		Assert.assertEquals(availablePermits(), 1, "The permit must have been returned");
+		Assert.assertTrue(done.await(2, TimeUnit.SECONDS),
+				"deliveryComplete() blocked while a publisher met the exhausted window - the deadlock has returned");
+		Assert.assertTrue(publisherReturned.await(2, TimeUnit.SECONDS),
+				"The publisher parked inside the publish path instead of buffering - it is holding the monitor "
+						+ "deliveryComplete() needs");
+		Assert.assertNull(publisherResult.get(),
+				"A publisher with no permit must buffer and return null, not block and not throw: "
+						+ publisherResult.get());
+
+		// The permit does not come to rest as a free permit: the drain takes it straight back for the message that
+		// was waiting on it. Asserting that end state proves the whole chain, rather than just that nothing hung.
+		awaitBufferDepth(0);
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of("topic/a", "topic/blocked"),
+				"The permit deliveryComplete() returned must have carried the buffered message out");
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
