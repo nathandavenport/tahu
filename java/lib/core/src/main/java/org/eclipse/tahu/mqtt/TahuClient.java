@@ -94,6 +94,9 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 10;
 	private static final long MAX_BUFFERED_PUBLISH_RETRY_DELAY = 500;
 
+	/* How often the start of buffering may be logged at WARN - see lastBufferingWarnTime. */
+	private static final long BUFFERING_WARN_INTERVAL = 30000;
+
 	/*
 	 * How long disconnect() will wait for the publish buffer to drain before publishing the LWT. Short on purpose:
 	 * disconnect() runs per client, so a transmitter backed by a pool pays this serially, and it only elapses when
@@ -242,6 +245,14 @@ public class TahuClient implements MqttCallbackExtended {
 	 * defines as "queued, not lost" - and then threw away. Only the second is a loss the caller could not see coming.
 	 */
 	private long publishBufferDiscardedMessageCount;
+
+	/*
+	 * When the last "buffering has started" warning was logged, so a client that oscillates between empty and one
+	 * queued message does not log a line per publish. At a publish rate that balances against the acknowledgement
+	 * rate that is exactly what happens, and the warning is worth keeping - it is where an operator sees that
+	 * backpressure began - but not at one line per message. Guarded by publishOrderLock like the rest.
+	 */
+	private long lastBufferingWarnTime;
 
 	private PublishBufferDrain publishBufferDrain;
 	private Thread publishBufferDrainThread;
@@ -921,7 +932,9 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			bufferAddLast(new BufferedPublish(topic, payload, qos, retained));
-			if (publishBuffer.size() == 1) {
+			long now = System.currentTimeMillis();
+			if (publishBuffer.size() == 1 && now - lastBufferingWarnTime >= BUFFERING_WARN_INTERVAL) {
+				lastBufferingWarnTime = now;
 				logger.warn("{}: Buffering publish on {} - {} - subsequent messages will queue behind it",
 						getClientId(), topic, reason);
 			} else {
@@ -1217,7 +1230,10 @@ public class TahuClient implements MqttCallbackExtended {
 
 							attempted = null;
 							if (publishBuffer.isEmpty()) {
-								logger.info("{}: Publish buffer drained", getClientId());
+								// DEBUG, not INFO: this is the other half of the buffering pair above, and an
+								// oscillating buffer would log it just as often. Publish Buffer Depth is where
+								// the state is meant to be read.
+								logger.debug("{}: Publish buffer drained", getClientId());
 							}
 						}
 					} catch (Throwable t) {

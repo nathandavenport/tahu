@@ -1,9 +1,16 @@
-/*
- * Licensed Materials - Property of Cirrus Link Solutions
- * Copyright (c) 2026 Cirrus Link Solutions LLC - All Rights Reserved
- * Unauthorized copying of this file, via any medium is strictly prohibited
- * Proprietary and confidential
- */
+/********************************************************************************
+ * Copyright (c) 2026 Cirrus Link Solutions and others
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Eclipse Public License 2.0 which is available at
+ * http://www.eclipse.org/legal/epl-2.0.
+ *
+ * SPDX-License-Identifier: EPL-2.0
+ *
+ * Contributors:
+ *   Cirrus Link Solutions - initial implementation
+ ********************************************************************************/
+
 package org.eclipse.tahu.mqtt.test;
 
 import java.lang.reflect.Field;
@@ -285,8 +292,22 @@ public class TahuClientPublishBufferTest {
 			Assert.assertTrue(topic.startsWith("topic/qos0-"), "Only QoS 0 should have been published: " + topic);
 		}
 
-		// QoS 0 never consumes a permit
-		Assert.assertEquals(availablePermits(), 0);
+		// Not asserted here that QoS 0 took no permit: the window starts empty in this test, so a permit count of
+		// zero would hold either way. qos0DoesNotConsumeAPermit checks it where it can fail.
+	}
+
+	/** QoS 0 takes no in-flight permit, checked with permits available so the assertion can actually fail. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void qos0DoesNotConsumeAPermit() throws Exception {
+		wire(8, 8);
+
+		for (int i = 0; i < 5; i++) {
+			tahuClient.publish("topic/qos0-" + i, "x".getBytes(), 0, false);
+		}
+
+		Assert.assertEquals(fakeClient.publishedTopics().size(), 5, "Precondition: every QoS 0 message went out");
+		Assert.assertEquals(availablePermits(), 8, "QoS 0 is not acknowledged and must not hold a permit");
 	}
 
 	/** A QoS 1 head with no permits must stay put rather than being dropped or reordered. */
@@ -541,7 +562,8 @@ public class TahuClientPublishBufferTest {
 		}
 
 		startGate.countDown();
-		Assert.assertTrue(finished.await(TIMEOUT_MS * 3, TimeUnit.MILLISECONDS), "Publishers did not finish - possible deadlock");
+		Assert.assertTrue(finished.await(TIMEOUT_MS * 3, TimeUnit.MILLISECONDS),
+				"Publishers did not finish - possible deadlock");
 		Assert.assertEquals(failures.get(), 0, "No publisher should have failed");
 		Assert.assertEquals(tahuClient.getPublishBufferDepth(), threads * perThread,
 				"Every message must be accounted for in the buffer");
