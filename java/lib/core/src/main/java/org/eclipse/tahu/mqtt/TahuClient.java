@@ -281,6 +281,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private volatile boolean lwtPublishSucceeded = true;
 
+	/*
+	 * Whether the last LWT attempt had to fall back to QoS 0. A downgraded death certificate is published but never
+	 * acknowledged, so it does not count as success for the purpose of deciding whether to send a clean DISCONNECT -
+	 * see publishLwtWithFallback() and the last resort in disconnect().
+	 */
+	private volatile boolean lwtDowngradedToQos0;
+
 	private Object clientLock = new Object();
 	private ConnectionMonitorThread connectionMonitorThread;
 
@@ -1604,10 +1611,13 @@ public class TahuClient implements MqttCallbackExtended {
 						}
 
 						/*
-						 * IMM-5460 - last resort. Every attempt to publish the death certificate failed, the QoS 0
-						 * fallback included. A clean DISCONNECT would tell the MQTT server we left gracefully and
-						 * suppress the Will, leaving subscribers with no death certificate at all - so drop the
-						 * connection instead and let the server publish the Will it already holds from connect().
+						 * IMM-5460 - last resort. No acknowledged death certificate was published: either every
+						 * attempt failed, or it went out downgraded to QoS 0 and carries no guarantee. A clean
+						 * DISCONNECT would tell the MQTT server we left gracefully and suppress the Will, leaving
+						 * subscribers with nothing better than that unacknowledged publish - so drop the connection
+						 * instead and let the server publish the Will it already holds from connect(). That Will is
+						 * QoS 1 and retained, so it is strictly the stronger of the two, and an identical retained
+						 * payload arriving twice is harmless.
 						 */
 						if (sendDisconnectPacket && !lwtPublishSucceeded) {
 							logger.warn("{}: Could not publish the LWT on {} by any route - closing without a "
@@ -2419,6 +2429,7 @@ public class TahuClient implements MqttCallbackExtended {
 	 * trade for a retained message - a subscriber that connects later still reads it from the MQTT server.
 	 */
 	private IMqttDeliveryToken publishLwtAtQos0(byte[] payload) {
+		lwtDowngradedToQos0 = true;
 		logger.warn("{}: LWT on {} cannot be published at QoS {} - the in-flight window is exhausted or the publish "
 				+ "buffer is in use. Retrying at QoS 0 so the death certificate is not lost.", getClientId(), lwtTopic,
 				lwtQoS);
@@ -2434,6 +2445,7 @@ public class TahuClient implements MqttCallbackExtended {
 		synchronized (clientLock) {
 			boolean clientConnected = client != null && client.isConnected();
 			boolean lwtDeliveryComplete = false;
+			lwtDowngradedToQos0 = false;
 			// Nothing attempted yet means nothing for disconnect() to escalate over
 			lwtPublishSucceeded = true;
 			if (lwtTopic != null && clientConnected) {
@@ -2474,7 +2486,17 @@ public class TahuClient implements MqttCallbackExtended {
 						logger.debug("{}: published on LWT Topic={}, messageId={}", getClientId(), lwtTopic,
 								lwtDeliveryToken.getMessageId());
 						lwtPublished = true;
-						lwtPublishSucceeded = true;
+
+						/*
+						 * A QoS 0 token means Paho accepted the message, not that the MQTT server received it - there
+						 * is no PUBACK, and this path is only reached when that server is already not acknowledging.
+						 * Treating it as success sent a clean DISCONNECT, which told the server to suppress the Will
+						 * it has held since connect() - so the one remaining chance was spent to protect a publish
+						 * that carries no guarantee. The Will is registered at QoS 1, retained, from the same
+						 * payload and timestamp, so it is the better of the two; and a duplicate retained death
+						 * certificate is harmless, so keeping both costs nothing.
+						 */
+						lwtPublishSucceeded = !lwtDowngradedToQos0;
 					} else {
 						logger.warn("Failed to publish LWT {}", lwtTopic);
 					}

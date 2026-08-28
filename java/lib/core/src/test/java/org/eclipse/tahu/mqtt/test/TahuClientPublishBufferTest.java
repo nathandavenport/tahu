@@ -1002,6 +1002,48 @@ public class TahuClientPublishBufferTest {
 				+ "it has no reason to drain");
 	}
 
+	/**
+	 * A death certificate downgraded to QoS 0 must not buy a clean DISCONNECT.
+	 *
+	 * The QoS 0 fallback returns Paho's token, which says the message was accepted locally - not that the MQTT
+	 * server received it. There is no PUBACK, and this path is only reached when that server is already not
+	 * acknowledging. Treating it as success sent a clean DISCONNECT, which tells the server to suppress the Will it
+	 * has held since connect() - spending the last remaining chance to protect a publish that carries no guarantee.
+	 *
+	 * The Will is registered at QoS 1 and retained, from the same payload and timestamp, so it is strictly the
+	 * stronger of the two. Sparkplug requires a Host Application's STATE death at QoS 1, which the downgrade is not.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aDowngradedLwtDoesNotSuppressTheWill() throws Exception {
+		wire(0, 8);
+		configureLwt(1);
+
+		tahuClient.disconnect(0, 1, true, true, false);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(LWT_TOPIC),
+				"The QoS 0 fallback must still go out - it is free and may arrive");
+		Assert.assertFalse(fakeClient.disconnectSent,
+				"A downgraded LWT is not acknowledged, so the DISCONNECT must be suppressed and the QoS 1 Will "
+						+ "allowed to fire");
+		Assert.assertTrue(fakeClient.disconnectForciblyCalled, "The disconnect must still complete");
+	}
+
+	/** The converse: an LWT that went out at its configured QoS is acknowledged, so the clean DISCONNECT stands. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void anAcknowledgedLwtStillSendsTheDisconnect() throws Exception {
+		wire(8, 8);
+		configureLwt(1);
+
+		tahuClient.disconnect(0, 1, true, true, false);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(LWT_TOPIC));
+		Assert.assertTrue(fakeClient.disconnectSent,
+				"With the death certificate acknowledged there is nothing for the Will to add, and a clean "
+						+ "DISCONNECT is the correct close");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Byte capacity
 	// ------------------------------------------------------------------------------------------------------------
