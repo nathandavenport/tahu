@@ -775,6 +775,56 @@ public class TahuClientPublishBufferTest {
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
+	// Async publishes
+	// ------------------------------------------------------------------------------------------------------------
+
+	/**
+	 * A retrying async publish must occupy one buffer slot, however many attempts its retry budget allows.
+	 *
+	 * The retry loop had no success break, and handlePublish() could not tell it there had been one - it discarded
+	 * publishOrBuffer()'s return and swallowed the exception. Under backpressure the first attempt buffered the
+	 * message and every later attempt appended another copy of it, so numAttempts copies of one BIRTH or DATA
+	 * message were delivered when permits returned. Identical copies, same payload, so no subscriber can tell them
+	 * apart from a real rebirth.
+	 *
+	 * Not reachable before this branch: the first attempt blocked in semaphore.acquire() and never returned to the
+	 * loop - the deadlock this work removed was hiding the missing break.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void asyncPublishWithRetryBuffersOneCopyOfTheMessage() throws Exception {
+		wire(0, 8);
+
+		tahuClient.asyncPublish("topic/async", "x".getBytes(), 1, false, true, 20, 3);
+		Thread.sleep(400);
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 1,
+				"One logical message must occupy one buffer slot, however many retry attempts it was given");
+	}
+
+	/**
+	 * A rejected async publish is still retried, since that is the outcome retrying exists for.
+	 *
+	 * The buffer is full, so nothing holds the message and each attempt is a genuine new one. This is what stops the
+	 * success break above from turning "retry" into "try once".
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void asyncPublishRetriesWhenTheBufferRejectsIt() throws Exception {
+		wire(0, 8);
+		tahuClient.setPublishBufferCapacity(1);
+		tahuClient.publish("topic/filler", "x".getBytes(), 1, false);
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 1, "Precondition: the buffer is at capacity");
+
+		tahuClient.asyncPublish("topic/async", "x".getBytes(), 1, false, true, 20, 3);
+		Thread.sleep(400);
+
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 3,
+				"Every attempt against a full buffer is a real attempt and must be counted as a rejection");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 1, "A rejected message must not be buffered");
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
 	// Harness
 	// ------------------------------------------------------------------------------------------------------------
 

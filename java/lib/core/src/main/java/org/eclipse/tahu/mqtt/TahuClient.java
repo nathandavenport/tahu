@@ -1809,18 +1809,34 @@ public class TahuClient implements MqttCallbackExtended {
 		public void run() {
 			try {
 				if (retry) {
-					for (int i = 0; i < numAttempts; i++) {
+					/*
+					 * Stops at the first attempt the client accepts, which is what makes this a retry rather than a
+					 * repeat. publishOrBuffer() accepts a message either by sending it or by queueing it, and a
+					 * queued message is already on its way - resubmitting then appends a second copy of the same
+					 * message to the buffer, and every further attempt appends another. Only an outright rejection,
+					 * which today means the buffer is at capacity, is worth another attempt.
+					 */
+					boolean accepted = false;
+					for (int i = 0; i < numAttempts && !accepted; i++) {
 						if (client == null || !client.isConnected()) {
 							Thread.sleep(retryDelay);
 						} else {
-							handlePublish();
+							accepted = handlePublish();
+							if (!accepted && i < numAttempts - 1) {
+								// The retry budget has to span time to be worth anything - a rejection is a full
+								// buffer, and back-to-back attempts give it no chance to drain. Not after the last
+								// attempt, which has nothing left to wait for.
+								Thread.sleep(retryDelay);
+							}
 						}
 					}
 
-					logger.error("{}: Failed to publish message on {} after {} attempts", getClientId(), topic,
-							numAttempts);
-					throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
-							"Failed to publish message on " + topic + " after " + numAttempts + " attempts");
+					if (!accepted) {
+						logger.error("{}: Failed to publish message on {} after {} attempts", getClientId(), topic,
+								numAttempts);
+						throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+								"Failed to publish message on " + topic + " after " + numAttempts + " attempts");
+					}
 				} else {
 					if (client == null) {
 						throw new TahuException(TahuErrorCode.INTERNAL_ERROR, "MQTT client is null");
@@ -1835,13 +1851,21 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 		}
 
-		private void handlePublish() throws Exception {
+		/**
+		 * @return true if the client took responsibility for the message - either sent inline or queued in the
+		 *         publish buffer, which {@link #publish(String, byte[], int, boolean)} signals with a null token and
+		 *         defines as "queued, not lost". False only if it was rejected outright and nothing holds it, which
+		 *         is the one outcome worth another attempt.
+		 */
+		private boolean handlePublish() throws Exception {
 			try {
 				// Same path as publish() so async publishes cannot jump ahead of anything already buffered
 				publishOrBuffer(topic, payload, qos, retained);
+				return true;
 			} catch (TahuException e) {
-				// Swallowed rather than rethrown so the retry loop in run() keeps its existing behavior
+				// Logged rather than rethrown: the caller is on another thread and has nothing to catch it
 				logger.error("{}: Failed to publish on {} - {}", getClientId(), topic, e.getMessage());
+				return false;
 			}
 		}
 	}
