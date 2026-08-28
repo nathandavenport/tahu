@@ -282,6 +282,8 @@ public class TahuClientPublishBufferTest {
 		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 3, "A rejected publish must not be buffered");
 		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
 				"A capacity rejection must be counted so the loss is visible to an operator");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 0,
+				"A refusal the caller was told about is not a discard - publish() threw, so nothing was lost here");
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
@@ -338,8 +340,10 @@ public class TahuClientPublishBufferTest {
 		Assert.assertTrue(fakeClient.publishAttempts() >= 3,
 				"The window should still afford about three attempts, made " + fakeClient.publishAttempts());
 		Assert.assertEquals(availablePermits(), 8, "Every permit taken for a failed send must be returned");
-		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 1,
 				"A dropped message is lost data and must be counted - publish() told the caller it was queued");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 0,
+				"A message this client accepted and then lost is a discard, not a capacity rejection");
 	}
 
 	/**
@@ -643,6 +647,98 @@ public class TahuClientPublishBufferTest {
 				"No message queued before the disconnect may reach the MQTT server on the next session");
 	}
 
+	/**
+	 * Once the drain is gone, a message that would be buffered is refused rather than accepted.
+	 *
+	 * The client still reports connected from the drain shutdown until disconnectForcibly(), so publish() used to
+	 * accept into a buffer nothing owned - a concurrent publisher, an AsyncPublisher thread, or publishLwt(), which
+	 * has call sites outside disconnect(). Those entries could then be inherited by the next session's drain and
+	 * flushed onto it; a retained death certificate replayed that way tells subscribers a live host is offline.
+	 *
+	 * Refusing is the honest answer: publish() returning null means "queued, not lost", which cannot be true of a
+	 * message no thread will ever send. The throw reaches the caller in time for it to store the message itself.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void publishIsRefusedWhenNoDrainOwnsTheBuffer() throws Exception {
+		wire(0, 8);
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+		Assert.assertNull(get(tahuClient, "publishBufferDrain"), "Precondition: nothing owns the buffer now");
+
+		try {
+			tahuClient.publish(LWT_TOPIC, "death".getBytes(), 1, true);
+			Assert.fail("A publish with no drain to send it must reach the caller as a failure, not return null");
+		} catch (TahuException e) {
+			Assert.assertTrue(e.getMessage().contains("no publish buffer drain"), "Unexpected message: " + e);
+		}
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0, "A refused message must not be buffered");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
+				"A refusal the caller was told about is a rejection, counted with the capacity refusals");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 0,
+				"Nothing was accepted, so nothing was discarded");
+	}
+
+	/**
+	 * A shutdown discards the buffer whether or not a drain is still registered.
+	 *
+	 * Belt and braces behind publishIsRefusedWhenNoDrainOwnsTheBuffer: that refusal is what keeps entries out of an
+	 * unowned buffer, and this is what guarantees any that got there anyway do not survive into the next session.
+	 * The discard used to sit below the publishBufferDrain == null guard, so the second shutdown - the one
+	 * connect() performs before every attempt - returned without clearing.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void shutdownDiscardsTheBufferEvenWithNoDrainRegistered() throws Exception {
+		wire(0, 8);
+		tahuClient.publish(LWT_TOPIC, "death".getBytes(), 1, true);
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 1, "Precondition: the message is queued");
+
+		// Drop the drain reference without touching the buffer, as the teardown window leaves it.
+		set(tahuClient, "publishBufferDrain", null);
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 1, "Precondition: the buffer outlived its drain");
+
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0,
+				"A shutdown must discard the buffer whether or not a drain is still registered");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 1,
+				"A discarded message is lost data and must be counted - publish() told the caller it was queued");
+
+		// Stand in for the new session, as bufferedMessagesAreNotReplayedOnTheNextSession does.
+		fakeClient.markConnected();
+		wire(8, 8);
+		Thread.sleep(DRAIN_POLL_MS * 3);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"Nothing queued in the old session may reach the MQTT server on the next one");
+	}
+
+	/** Discards are a lifetime total for the client, so they accumulate across sessions rather than resetting. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void discardedMessagesAccumulateOnTheLifetimeCounter() throws Exception {
+		wire(0, 8);
+		startDrain();
+		for (int i = 0; i < 3; i++) {
+			tahuClient.publish("topic/first-session-" + i, "x".getBytes(), 1, false);
+		}
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 3);
+
+		fakeClient.markConnected();
+		wire(0, 8);
+		startDrain();
+		for (int i = 0; i < 2; i++) {
+			tahuClient.publish("topic/second-session-" + i, "x".getBytes(), 1, false);
+		}
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 5,
+				"The counter is for the life of the client, not the life of a session");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 0,
+				"Nothing was refused at the door here - the buffer never reached capacity");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Harness
 	// ------------------------------------------------------------------------------------------------------------
@@ -651,11 +747,21 @@ public class TahuClientPublishBufferTest {
 	 * Puts the client into the state connect() would leave it in, but with a fake Paho client and a chosen number of
 	 * free permits. The drain thread is NOT started - tests that need it call startDrain() so they control timing.
 	 */
+	/**
+	 * Stands in for connect(): a live session, and a drain thread that owns the buffer.
+	 *
+	 * The drain is started here rather than left to each test because connect() starts it before the Paho client
+	 * exists, so a client that reports connected always has one. bufferPublish() now refuses a message when it does
+	 * not - see publishIsRefusedWhenNoDrainOwnsTheBuffer - and a harness that buffered without one was modelling a
+	 * state the client cannot be in. Tests that want the buffer to sit still wire 0 permits, which keeps the drain
+	 * parked on its acquire.
+	 */
 	private void wire(int availablePermits, int maxInflight) throws Exception {
 		set(tahuClient, "client", fakeClient);
 		set(tahuClient, "semaphore", new Semaphore(availablePermits, true));
 		set(tahuClient, "lockedMessageSet", ConcurrentHashMap.newKeySet());
 		set(tahuClient, "maxInFlightMessages", maxInflight);
+		startDrain();
 	}
 
 	private static final String LWT_TOPIC = "spBv1.0/G1/NDEATH/E1";

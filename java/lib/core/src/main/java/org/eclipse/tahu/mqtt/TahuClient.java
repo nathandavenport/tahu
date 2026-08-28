@@ -204,6 +204,14 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private long publishBufferRejectedMessageCount;
 
+	/*
+	 * Counted separately from publishBufferRejectedMessageCount, because the two mean different things to whoever is
+	 * looking at them. A rejection is a refusal at the door: publish() threw, so the caller knows and can store the
+	 * message itself. A discard is a message this client accepted - publish() returned null, which the contract
+	 * defines as "queued, not lost" - and then threw away. Only the second is a loss the caller could not see coming.
+	 */
+	private long publishBufferDiscardedMessageCount;
+
 	private PublishBufferDrain publishBufferDrain;
 	private Thread publishBufferDrainThread;
 
@@ -771,11 +779,25 @@ public class TahuClient implements MqttCallbackExtended {
 	 * INVARIANT: only QoS > 0 messages are ever buffered. The drain thread relies on this - it takes a permit before
 	 * dequeuing, so a buffered QoS 0 message (which needs no permit and is never ACKed) would stall the buffer for as
 	 * long as the in-flight window stayed exhausted. TahuClientPublishBufferTest#bufferNeverHoldsQos0Messages guards it.
+	 *
+	 * A message is also rejected when no drain thread owns the buffer, for the same reason as a full one: nothing
+	 * would ever send it. That state is not reachable during a live session - connect() starts the drain before the
+	 * Paho client exists, and publish() cannot get here with no client - so it means the disconnect is already
+	 * tearing this client down. Accepting there would return null, which publish() defines as "queued, not lost",
+	 * for a message certain to be discarded by the disconnect that is already running.
 	 */
 	private void bufferPublish(String topic, byte[] payload, int qos, boolean retained, String reason)
 			throws TahuException {
 		// Reentrant - every caller already holds this. Taken explicitly so the buffer can never be mutated without it.
 		synchronized (publishOrderLock) {
+			if (publishBufferDrain == null) {
+				// A refusal, not a discard: the caller is told in time to store the message itself.
+				publishBufferRejectedMessageCount++;
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+						"MQTT client: " + clientId.getMqttClientId() + " is disconnecting - no publish buffer drain "
+								+ "thread to send a buffered message, rejecting publish on " + topic);
+			}
+
 			if (publishBuffer.size() >= getPublishBufferCapacity()) {
 				publishBufferRejectedMessageCount++;
 				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
@@ -807,22 +829,35 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	/**
-	 * @return the number of publishes this client did not send, for the life of this client. Any non-zero value means
-	 *         the MQTT server stalled for longer than the buffer could absorb. Two routes reach this counter, and what
-	 *         the caller can do about the loss differs between them:
-	 *         <ul>
-	 *         <li>a capacity rejection, where {@link #publish(String, byte[], int, boolean)} throws so the caller can
-	 *         fall back to its own store and forward;</li>
-	 *         <li>a buffered message dropped once its retry window is spent - see requeueOrDrop(). That message is
-	 *         lost: publish() returned null, so the caller was told it was queued and has no other way to learn
-	 *         otherwise.</li>
-	 *         </ul>
-	 *         Not every loss is counted here. The buffer clear() in shutdownPublishBufferDrainThread() discards
-	 *         whatever is still queued at disconnect without counting it - IMM-5456.
+	 * @return the number of publishes refused because the publish buffer was already at capacity, for the life of
+	 *         this client. Any non-zero value means the MQTT server stalled for longer than the buffer could absorb.
+	 *         These are refusals rather than losses from the caller's point of view:
+	 *         {@link #publish(String, byte[], int, boolean)} throws, so the caller knows immediately and can fall
+	 *         back to its own store and forward. For messages this client accepted and then could not send, see
+	 *         {@link #getPublishBufferDiscardedMessageCount()}.
 	 */
 	public long getPublishBufferRejectedMessageCount() {
 		synchronized (publishOrderLock) {
 			return publishBufferRejectedMessageCount;
+		}
+	}
+
+	/**
+	 * @return the number of buffered publishes this client accepted and then did not send, for the life of this
+	 *         client. Every one of them is lost data the caller could not see coming, because
+	 *         {@link #publish(String, byte[], int, boolean)} returned null - "queued, not lost" - before the loss
+	 *         happened. Two routes reach it:
+	 *         <ul>
+	 *         <li>a buffered message dropped once its retry window is spent - see requeueOrDrop();</li>
+	 *         <li>the whole buffer discarded at disconnect, counted by the number of entries cleared. Since
+	 *         connect() disconnects first, an ordinary reconnect takes this route: a queued message must not be
+	 *         replayed onto the next session, so it is discarded here and counted.</li>
+	 *         </ul>
+	 *         IMM-5456 covers giving the caller a way to store these rather than lose them.
+	 */
+	public long getPublishBufferDiscardedMessageCount() {
+		synchronized (publishOrderLock) {
+			return publishBufferDiscardedMessageCount;
 		}
 	}
 
@@ -919,6 +954,26 @@ public class TahuClient implements MqttCallbackExtended {
 	private void shutdownPublishBufferDrainThread() {
 		final Thread drainThread;
 		synchronized (publishOrderLock) {
+			/*
+			 * Discard FIRST, and unconditionally - above the drain == null guard, not below it.
+			 *
+			 * A message can reach the buffer after the drain has already been stopped: publish() admits anything
+			 * while client.isConnected() is true, which it remains from here until disconnectForcibly(), including
+			 * across the deliberate sleep in disconnect(). Nothing owns those entries. Discarding them below the
+			 * guard meant the next disconnect - connect() calls one before every attempt, and by then the drain is
+			 * already null - returned without clearing, so connect()'s new drain thread found a non-empty buffer and
+			 * flushed the previous session's messages onto the new connection. For a death certificate that is a
+			 * retained "offline" arriving on a live session, ahead of the BIRTH queued behind it.
+			 */
+			if (!publishBuffer.isEmpty()) {
+				// Counted, not just logged: publish() told these callers the message was queued, not lost, so this
+				// is the only place the loss can be reported to them - see getPublishBufferDiscardedMessageCount().
+				publishBufferDiscardedMessageCount += publishBuffer.size();
+				logger.warn("{}: Discarding {} buffered publishes on shutdown", getClientId(), publishBuffer.size());
+				publishBuffer.clear();
+			}
+			publishOrderLock.notifyAll();
+
 			if (publishBufferDrain == null) {
 				return;
 			}
@@ -926,10 +981,8 @@ public class TahuClient implements MqttCallbackExtended {
 			drainThread = publishBufferDrainThread;
 			publishBufferDrain = null;
 			publishBufferDrainThread = null;
-			if (!publishBuffer.isEmpty()) {
-				logger.warn("{}: Discarding {} buffered publishes on shutdown", getClientId(), publishBuffer.size());
-				publishBuffer.clear();
-			}
+			// Again, now that keepRunning is false, so a drain parked in wait() sees the flag rather than relying on
+			// the interrupt below to be what stops it.
 			publishOrderLock.notifyAll();
 		}
 		if (drainThread != null) {
@@ -982,7 +1035,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 			// Counted, not just logged: publish() returned null for this message, so the caller was told it was
 			// queued and has no other way to learn that it was not sent.
-			publishBufferRejectedMessageCount++;
+			publishBufferDiscardedMessageCount++;
 			logger.error("{}: Dropping buffered publish on {} after {} attempts over {}ms", getClientId(),
 					attempted.topic, attempted.attempts, elapsed, cause);
 			return 0;
