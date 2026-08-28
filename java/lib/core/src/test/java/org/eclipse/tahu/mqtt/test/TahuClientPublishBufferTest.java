@@ -775,6 +775,101 @@ public class TahuClientPublishBufferTest {
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
+	// Byte capacity
+	// ------------------------------------------------------------------------------------------------------------
+
+	/**
+	 * The buffer is bounded by bytes as well as by message count.
+	 *
+	 * A count alone does not bound heap, which is the dimension that OOMs: payloads are held by reference and sized
+	 * by the caller, so the default 10,000 messages was 10,000 x an unknown. Measured before this bound existed, 100
+	 * x 1MB QoS 1 publishes were admitted without complaint and retained ~200MB.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void bufferRejectsAtItsByteCapacity() throws Exception {
+		wire(0, 8);
+		tahuClient.setPublishBufferByteCapacity(1000);
+
+		tahuClient.publish("topic/a", new byte[400], 1, false);
+		tahuClient.publish("topic/b", new byte[400], 1, false);
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 800, "Precondition: both are queued and accounted");
+
+		try {
+			tahuClient.publish("topic/c", new byte[400], 1, false);
+			Assert.fail("A publish past the byte budget must throw so the caller can store the message");
+		} catch (TahuException e) {
+			Assert.assertTrue(e.getMessage().contains("byte capacity"), "Unexpected message: " + e.getMessage());
+		}
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 2, "The rejected message must not be buffered");
+		Assert.assertTrue(tahuClient.getPublishBufferDepth() < tahuClient.getPublishBufferCapacity(),
+				"The count bound must not be what rejected it - that would prove nothing about the byte bound");
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 800, "A rejected payload must not be accounted for");
+		Assert.assertEquals(tahuClient.getPublishBufferRejectedMessageCount(), 1,
+				"A byte-budget refusal is a rejection: the caller was told and can still store it");
+	}
+
+	/** One payload larger than the whole budget is refused on its own terms, not as a full buffer. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void payloadLargerThanTheWholeBudgetIsRejectedOutright() throws Exception {
+		wire(0, 8);
+		tahuClient.setPublishBufferByteCapacity(1000);
+
+		try {
+			tahuClient.publish("topic/huge", new byte[2000], 1, false);
+			Assert.fail("A payload that can never fit must be rejected rather than queued");
+		} catch (TahuException e) {
+			Assert.assertTrue(e.getMessage().contains("exceeds the whole publish buffer budget"),
+					"The message must name the payload, not the buffer state: " + e.getMessage());
+		}
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0, "Nothing was queued");
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 0, "Nothing was accounted for");
+	}
+
+	/**
+	 * The byte total tracks the buffer exactly, including across a failed send.
+	 *
+	 * This is the invariant the whole bound rests on. A total that drifts above the truth does not fail where it
+	 * drifted - it fails later, as a client refusing every publish against a buffer that looks empty, which is the
+	 * same shape as an in-flight permit drifting from Paho's window. The requeue path is where drift would start,
+	 * since a failed send removes an entry from the head and puts it back.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void bufferBytesReturnToZeroAcrossAFailedSend() throws Exception {
+		wire(0, 8);
+		tahuClient.publish("topic/first", new byte[100], 1, false);
+		tahuClient.publish("topic/second", new byte[100], 1, false);
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 200);
+
+		fakeClient.failNextPublishes(1);
+		releasePermits(8);
+		awaitBufferDepth(0);
+
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 0,
+				"An empty buffer must account for zero bytes - a failed send removes and re-adds its message");
+	}
+
+	/** The disconnect discard clears the byte total with the messages it throws away. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void discardingTheBufferClearsTheByteTotal() throws Exception {
+		wire(0, 8);
+		tahuClient.publish("topic/a", new byte[100], 1, false);
+		tahuClient.publish("topic/b", new byte[100], 1, false);
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 200, "Precondition: both are accounted for");
+
+		invoke(tahuClient, "shutdownPublishBufferDrainThread");
+
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0);
+		Assert.assertEquals(tahuClient.getPublishBufferBytes(), 0,
+				"A discarded buffer must release its byte budget, or the client refuses publishes forever after");
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
 	// Async publishes
 	// ------------------------------------------------------------------------------------------------------------
 

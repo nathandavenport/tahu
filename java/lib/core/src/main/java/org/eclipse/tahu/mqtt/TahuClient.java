@@ -58,6 +58,19 @@ public class TahuClient implements MqttCallbackExtended {
 	private static final long DEFAULT_CONNECT_MONITOR_INTERVAL = 10000;
 	private static final long DEFAULT_CONNECT_ATTEMPT_TIMEOUT = 30000;
 	private static final int DEFAULT_PUBLISH_BUFFER_CAPACITY = 10000;
+	/*
+	 * The second bound on the publish buffer, in bytes of payload.
+	 *
+	 * A count alone does not bound heap, which is the dimension that OOMs: payloads are held by reference and are
+	 * whatever the caller passes, so 10,000 messages is 10,000 x an unknown. Measured, 100 x 1MB QoS 1 publishes were
+	 * admitted without complaint and retained ~200MB.
+	 *
+	 * Deliberately a fixed default rather than a fraction of Runtime.maxMemory(): a heap-relative bound behaves
+	 * differently on a laptop and on a gateway, so the same traffic would be accepted in one place and rejected in
+	 * the other, and a support case would not reproduce. 128MB is small against any heap a broker-facing JVM runs
+	 * with, and large enough that only genuinely large payloads under a sustained stall reach it.
+	 */
+	private static final long DEFAULT_PUBLISH_BUFFER_BYTE_CAPACITY = 128L * 1024 * 1024;
 	private static final long PUBLISH_BUFFER_POLL_INTERVAL = 250;
 	/*
 	 * The retry budget for a buffered publish that fails to send, as a window of wall clock rather than a count of
@@ -181,6 +194,13 @@ public class TahuClient implements MqttCallbackExtended {
 	private volatile int publishBufferCapacity = DEFAULT_PUBLISH_BUFFER_CAPACITY;
 
 	/*
+	 * The same bound expressed in bytes of buffered payload - see DEFAULT_PUBLISH_BUFFER_BYTE_CAPACITY. Whichever
+	 * bound is reached first rejects the publish, and a single payload larger than the whole budget is rejected
+	 * outright so one oversized message cannot occupy the buffer alone.
+	 */
+	private volatile long publishBufferByteCapacity = DEFAULT_PUBLISH_BUFFER_BYTE_CAPACITY;
+
+	/*
 	 * The FIFO publish buffer, the lock guarding both it and publish ordering, and the thread that drains it.
 	 *
 	 * publishOrderLock guards the decision "publish now or queue" so that, in normal operation, no message overtakes one
@@ -197,6 +217,17 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private final Object publishOrderLock = new Object();
 	private final Deque<BufferedPublish> publishBuffer = new ArrayDeque<>();
+
+	/*
+	 * Running total of the payload bytes in publishBuffer, guarded by publishOrderLock like the buffer itself.
+	 *
+	 * Maintained ONLY by bufferAddLast, bufferAddFirst, bufferRemoveFirst and bufferClear below - nothing else may
+	 * touch publishBuffer directly. A sum that drifts from the deque is the same class of defect as a permit drifting
+	 * above Paho's window: it does not fail where it happened, it fails later, as a client that refuses everything
+	 * against a buffer that looks empty. The requeue path is where that would start, since a failed send removes an
+	 * entry from the head and puts it back.
+	 */
+	private long publishBufferBytes;
 	/*
 	 * Cumulative count of publishes rejected because the buffer was full. Guarded by publishOrderLock like the
 	 * buffer itself. Never reset while the client lives - it is a lifetime counter, not a gauge, so a consumer
@@ -367,6 +398,34 @@ public class TahuClient implements MqttCallbackExtended {
 
 	public int getPublishBufferCapacity() {
 		return this.publishBufferCapacity;
+	}
+
+	/**
+	 * Sets the second bound on the publish buffer: the total payload bytes it may hold.
+	 *
+	 * The count bound does not bound heap. Payloads are held by reference and sized by the caller, so a capacity of
+	 * 10,000 messages is 10,000 times an unknown - which is the failure this buffer exists to prevent, arrived at
+	 * from the other direction. Whichever bound is reached first rejects the publish.
+	 *
+	 * @param publishBufferByteCapacity total payload bytes the buffer may hold, default 128MB
+	 */
+	public void setPublishBufferByteCapacity(long publishBufferByteCapacity) {
+		this.publishBufferByteCapacity = publishBufferByteCapacity;
+	}
+
+	public long getPublishBufferByteCapacity() {
+		return this.publishBufferByteCapacity;
+	}
+
+	/**
+	 * @return the payload bytes currently held in the publish buffer. The companion to
+	 *         {@link #getPublishBufferDepth()}, and the one that predicts heap: depth counts messages, which says
+	 *         nothing about what they cost to hold.
+	 */
+	public long getPublishBufferBytes() {
+		synchronized (publishOrderLock) {
+			return publishBufferBytes;
+		}
 	}
 
 	public void setDoLatencyCheck(boolean state) {
@@ -780,6 +839,32 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
+	/*
+	 * The only four ways publishBuffer may be mutated. Every one of them keeps publishBufferBytes in step, which is
+	 * why they exist: an add or a remove that forgot the total would leave the client refusing publishes against a
+	 * buffer that had already drained. All must be called holding publishOrderLock.
+	 */
+	private void bufferAddLast(BufferedPublish message) {
+		publishBuffer.addLast(message);
+		publishBufferBytes += message.payload.length;
+	}
+
+	private void bufferAddFirst(BufferedPublish message) {
+		publishBuffer.addFirst(message);
+		publishBufferBytes += message.payload.length;
+	}
+
+	private BufferedPublish bufferRemoveFirst() {
+		BufferedPublish message = publishBuffer.removeFirst();
+		publishBufferBytes -= message.payload.length;
+		return message;
+	}
+
+	private void bufferClear() {
+		publishBuffer.clear();
+		publishBufferBytes = 0;
+	}
+
 	/**
 	 * Appends a message to the publish buffer. Must be called holding {@link #publishOrderLock}.
 	 *
@@ -817,7 +902,25 @@ public class TahuClient implements MqttCallbackExtended {
 								+ ") - rejecting publish on " + topic);
 			}
 
-			publishBuffer.addLast(new BufferedPublish(topic, payload, qos, retained));
+			// Checked before the budget so the message names the payload rather than the buffer's current state -
+			// a message this size will never fit, whatever else is queued, and saying so is more use than "full".
+			if (payload.length > getPublishBufferByteCapacity()) {
+				publishBufferRejectedMessageCount++;
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+						"MQTT client: " + clientId.getMqttClientId() + " payload of " + payload.length
+								+ " bytes exceeds the whole publish buffer budget of " + getPublishBufferByteCapacity()
+								+ " bytes - rejecting publish on " + topic);
+			}
+
+			if (publishBufferBytes + payload.length > getPublishBufferByteCapacity()) {
+				publishBufferRejectedMessageCount++;
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+						"MQTT client: " + clientId.getMqttClientId() + " publish buffer is at its byte capacity ("
+								+ publishBufferBytes + "/" + getPublishBufferByteCapacity() + " bytes, "
+								+ publishBuffer.size() + " messages) - rejecting publish on " + topic);
+			}
+
+			bufferAddLast(new BufferedPublish(topic, payload, qos, retained));
 			if (publishBuffer.size() == 1) {
 				logger.warn("{}: Buffering publish on {} - {} - subsequent messages will queue behind it",
 						getClientId(), topic, reason);
@@ -980,8 +1083,9 @@ public class TahuClient implements MqttCallbackExtended {
 				// Counted, not just logged: publish() told these callers the message was queued, not lost, so this
 				// is the only place the loss can be reported to them - see getPublishBufferDiscardedMessageCount().
 				publishBufferDiscardedMessageCount += publishBuffer.size();
-				logger.warn("{}: Discarding {} buffered publishes on shutdown", getClientId(), publishBuffer.size());
-				publishBuffer.clear();
+				logger.warn("{}: Discarding {} buffered publishes ({} bytes) on shutdown", getClientId(),
+						publishBuffer.size(), publishBufferBytes);
+				bufferClear();
 			}
 			publishOrderLock.notifyAll();
 
@@ -1035,7 +1139,7 @@ public class TahuClient implements MqttCallbackExtended {
 			long elapsed = now - attempted.firstFailureTime;
 
 			if (elapsed < MAX_BUFFERED_PUBLISH_RETRY_WINDOW && attempted.attempts < MAX_BUFFERED_PUBLISH_ATTEMPTS) {
-				publishBuffer.addFirst(attempted);
+				bufferAddFirst(attempted);
 				long delay = Math.min(PUBLISH_BUFFER_POLL_INTERVAL * attempted.attempts,
 						MAX_BUFFERED_PUBLISH_RETRY_DELAY);
 				logger.warn("{}: Failed to send buffered publish on {} - re-queued at head, attempt {}, {}ms into a "
@@ -1106,7 +1210,7 @@ public class TahuClient implements MqttCallbackExtended {
 								continue;
 							}
 
-							publishBuffer.removeFirst();
+							bufferRemoveFirst();
 							attempted = head;
 							permitOwnershipTransferred = true;
 							publishWithPermit(permitHolder, head.topic, head.payload, head.qos, head.retained);
