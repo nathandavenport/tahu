@@ -739,6 +739,41 @@ public class TahuClientPublishBufferTest {
 				"Nothing was refused at the door here - the buffer never reached capacity");
 	}
 
+	/**
+	 * A QoS 0 publish must not wait for the buffer to drain.
+	 *
+	 * QoS 0 takes no permit and is never buffered, so nothing about it depends on the acknowledged queue - holding it
+	 * behind one makes live data stale for no delivery benefit. Every Sparkplug publish in tahu is QoS 0, and
+	 * EdgeClient publishes while holding its own clientLock, so a QoS 0 publisher stuck behind the drain stalls the
+	 * whole Sparkplug path including sequence number allocation.
+	 *
+	 * Timing-based by necessity, with a wide margin: the drain holds the MQTT client for 5 x 200ms here, and the
+	 * assertion only fails if the QoS 0 publish waited for more than a couple of those.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 2)
+	public void qos0DoesNotWaitForTheBufferToDrain() throws Exception {
+		wire(0, 8);
+		for (int i = 0; i < 5; i++) {
+			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
+		}
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 5, "Precondition: the drain has work to do");
+
+		fakeClient.setPublishDelay(200);
+		releasePermits(8);
+		// Let the drain get inside a send, so the QoS 0 publish arrives while the client is genuinely busy
+		Thread.sleep(100);
+
+		long start = System.currentTimeMillis();
+		tahuClient.publish("topic/live", "x".getBytes(), 0, false);
+		long elapsed = System.currentTimeMillis() - start;
+
+		// The two regimes are far apart: taking publishOrderLock measured 500-904ms across runs, against a drain
+		// holding the client for 5 x 200ms. Bypassing it costs only this message's own send - a flat 201ms here.
+		Assert.assertTrue(elapsed < 450, "QoS 0 waited " + elapsed + "ms for the buffer to drain - it must not queue "
+				+ "behind acknowledged traffic, and the wait scales with buffer depth");
+	}
+
 	// ------------------------------------------------------------------------------------------------------------
 	// Harness
 	// ------------------------------------------------------------------------------------------------------------
@@ -864,6 +899,7 @@ public class TahuClientPublishBufferTest {
 		private final AtomicInteger failuresRemaining = new AtomicInteger();
 		private final AtomicBoolean connected = new AtomicBoolean(true);
 		private final AtomicInteger nextMessageId = new AtomicInteger(1);
+		private volatile long publishDelayMs;
 		private volatile TahuClient ackTarget;
 		private volatile ExecutorService ackExecutor;
 		private volatile boolean disconnectSent;
@@ -898,6 +934,11 @@ public class TahuClientPublishBufferTest {
 		/* Brings the fake back up, so a test can model a genuinely live next session. */
 		private void markConnected() {
 			connected.set(true);
+		}
+
+		/* Holds each send open, so a test can observe what a caller sees while the drain is mid-publish. */
+		private void setPublishDelay(long millis) {
+			publishDelayMs = millis;
 		}
 
 		private void failNextPublishes(int count) {
@@ -937,6 +978,15 @@ public class TahuClientPublishBufferTest {
 		public IMqttDeliveryToken publish(String topic, byte[] payload, int qos, boolean retained)
 				throws MqttException {
 			attempts.incrementAndGet();
+			long delay = publishDelayMs;
+			if (delay > 0) {
+				try {
+					Thread.sleep(delay);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					throw new MqttException(e);
+				}
+			}
 			if (failuresRemaining.get() > 0) {
 				failuresRemaining.decrementAndGet();
 				// 32202 == REASON_CODE_MAX_INFLIGHT, the realistic transient failure

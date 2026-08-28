@@ -691,22 +691,33 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private IMqttDeliveryToken publishOrBuffer(String topic, byte[] payload, int qos, boolean retained)
 			throws TahuException {
-		synchronized (publishOrderLock) {
-			// QoS 0 takes no permit and is never subject to backpressure, so it is always sent immediately -
-			// it is never buffered, even while QoS > 0 messages are queued. This means a QoS 0 message CAN
-			// overtake buffered QoS > 0 messages during a stall. That is deliberate: MQTT only orders within a
-			// QoS level, and holding live fire-and-forget data behind a stalled acknowledged queue would make it
-			// stale for no delivery benefit.
-			if (qos == 0) {
-				try {
-					logger.debug("{}: Publishing with QoS0 on {}, Payload size = {}", getClientId(), topic,
-							payload.length);
-					return client.publish(topic, payload, qos, retained);
-				} catch (Throwable t) {
-					throw new TahuException(TahuErrorCode.INTERNAL_ERROR, t);
-				}
+		/*
+		 * QoS 0 takes no permit and is never subject to backpressure, so it is always sent immediately - it is never
+		 * buffered, even while QoS > 0 messages are queued. This means a QoS 0 message CAN overtake buffered QoS > 0
+		 * messages during a stall. That is deliberate: MQTT only orders within a QoS level, and holding live
+		 * fire-and-forget data behind a stalled acknowledged queue would make it stale for no delivery benefit.
+		 *
+		 * Deliberately OUTSIDE publishOrderLock, and it has to be for any of the above to be true. The drain thread
+		 * holds that monitor across client.publish() for every buffered message, and Java monitors are not fair, so a
+		 * QoS 0 publisher that took it would queue behind the drain rather than slot in between its iterations -
+		 * measured at 500-900ms against a five message backlog, and it scales with buffer depth. This path touches
+		 * neither publishBuffer nor semaphore, only the volatile client, so it needs no lock at all. Every Sparkplug
+		 * publish is QoS 0, and EdgeClient publishes while holding its own clientLock, so a QoS 0 publisher stalled
+		 * here stalls the whole Sparkplug path with it - sequence number allocation included.
+		 */
+		if (qos == 0) {
+			// Read once: disconnect() nulls the field without holding publishOrderLock, and holding it here would
+			// not have helped anyway.
+			final TahuMqttAsyncClient publishClient = client;
+			try {
+				logger.debug("{}: Publishing with QoS0 on {}, Payload size = {}", getClientId(), topic, payload.length);
+				return publishClient.publish(topic, payload, qos, retained);
+			} catch (Throwable t) {
+				throw new TahuException(TahuErrorCode.INTERNAL_ERROR, t);
 			}
+		}
 
+		synchronized (publishOrderLock) {
 			// Order preservation among QoS > 0: anything queued means this message queues behind it
 			if (!publishBuffer.isEmpty()) {
 				bufferPublish(topic, payload, qos, retained, "buffer is draining");
