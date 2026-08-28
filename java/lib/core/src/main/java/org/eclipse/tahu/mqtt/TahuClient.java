@@ -2237,10 +2237,37 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
+	/**
+	 * Publishes the BIRTH, or forces a reconnect if the acknowledged path cannot take it right now.
+	 *
+	 * The backpressure check happens BEFORE publishing, for the same reason as
+	 * {@link #publishLwtWithFallback(byte[])}: {@link #publishOrBuffer(String, byte[], int, boolean)} appends to the
+	 * buffer and then returns null, so reacting to the null afterwards would leave a queued copy behind and could
+	 * deliver the BIRTH twice.
+	 *
+	 * Where the LWT falls back to QoS 0, this falls back to a reconnect. The death certificate has no second chance -
+	 * the buffer is torn down moments later and a clean DISCONNECT suppresses the Will - but a BIRTH does: the
+	 * session it announces is the thing being restarted, so dropping the connection and letting connect() publish it
+	 * again on a fresh session is both simpler and more correct than announcing a session whose BIRTH never went out.
+	 *
+	 * A buffered BIRTH is not a published BIRTH. Before the publish buffer existed this could not arise, because
+	 * publish() blocked until the message was handed to Paho, so "returned without throwing" meant "on the wire" -
+	 * which is the behaviour this method was written against, and why it recovers only from an exception.
+	 */
 	public void publishBirthMessage() {
 		synchronized (clientLock) {
 			if (birthTopic != null && client.isConnected()) {
 				try {
+					// The two conditions publishOrBuffer() buffers on. Reached from setOnlineState() mid-session,
+					// where the window can be exhausted; connect() rebuilds the semaphore before the client exists,
+					// so the connectComplete() route always finds a full window and an empty buffer.
+					if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
+						throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
+								"MQTT client: " + clientId.getMqttClientId() + " cannot publish the BIRTH on "
+										+ birthTopic + " without queueing it behind buffered messages - "
+										+ getAvailablePublishPermits() + " permits free, buffer depth "
+										+ getPublishBufferDepth());
+					}
 
 					if (useSparkplugStatePayload) {
 						byte[] payload;
@@ -2267,6 +2294,8 @@ public class TahuClient implements MqttCallbackExtended {
 						publish(birthTopic, birthPayload, MqttOperatorDefs.QOS1, birthRetain);
 					}
 				} catch (TahuException ce) {
+					// Covers both a failed publish and a BIRTH that would have been buffered: in either case no
+					// BIRTH reached the MQTT server, so the session must not be left announcing itself as online.
 					logger.error("{}: Error in birth topic publish on connect", getClientId(), ce);
 					try {
 						client.disconnectForcibly(0, 1, false);

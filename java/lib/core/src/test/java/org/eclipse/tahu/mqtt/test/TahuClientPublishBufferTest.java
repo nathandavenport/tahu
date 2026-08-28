@@ -828,6 +828,51 @@ public class TahuClientPublishBufferTest {
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
+	// BIRTH
+	// ------------------------------------------------------------------------------------------------------------
+
+	/**
+	 * A BIRTH that would be buffered is not a published BIRTH, and must not leave the session announcing itself.
+	 *
+	 * publishBirthMessage() recovers only from a TahuException, which was sound while publish() blocked until the
+	 * message reached Paho - "returned without throwing" meant "on the wire". A buffered publish returns null
+	 * instead, so the recovery could not fire: the caller marked the session online with no BIRTH sent, and the
+	 * queued copy was then dropped when its retry window expired or discarded on the next reconnect.
+	 *
+	 * Reached from setOnlineState() mid-session. connect() rebuilds the semaphore before the Paho client exists, so
+	 * the connectComplete() route always finds a full window and an empty buffer.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void birthIsNotConsideredPublishedWhenItWouldBeBuffered() throws Exception {
+		wire(0, 8);
+		configureBirth();
+
+		tahuClient.publishBirthMessage();
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"No BIRTH reached the MQTT server, so none may be reported as sent");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0,
+				"A queued BIRTH would be delivered late, out of session, or dropped - it must not be queued at all");
+		Assert.assertTrue(fakeClient.disconnectForciblyCalled,
+				"With no BIRTH on the wire the session must be dropped so connect() can publish one on a fresh "
+						+ "session, which is the recovery the exception path already performs");
+	}
+
+	/** With a permit free, the BIRTH goes out inline and the session stands. */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void birthIsPublishedInlineWhenTheWindowHasRoom() throws Exception {
+		wire(8, 8);
+		configureBirth();
+
+		tahuClient.publishBirthMessage();
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(BIRTH_TOPIC), "The BIRTH must go out inline");
+		Assert.assertFalse(fakeClient.disconnectForciblyCalled, "A published BIRTH is not a reason to reconnect");
+	}
+
+	// ------------------------------------------------------------------------------------------------------------
 	// Byte capacity
 	// ------------------------------------------------------------------------------------------------------------
 
@@ -998,12 +1043,20 @@ public class TahuClientPublishBufferTest {
 	}
 
 	private static final String LWT_TOPIC = "spBv1.0/G1/NDEATH/E1";
+	private static final String BIRTH_TOPIC = "spBv1.0/STATE/host-1";
 
 	private void configureLwt(int qos) throws Exception {
 		set(tahuClient, "lwtTopic", LWT_TOPIC);
 		set(tahuClient, "lwtPayload", "death".getBytes());
 		set(tahuClient, "lwtQoS", qos);
 		set(tahuClient, "lwtRetain", false);
+	}
+
+	private void configureBirth() throws Exception {
+		set(tahuClient, "birthTopic", BIRTH_TOPIC);
+		set(tahuClient, "birthPayload", "birth".getBytes());
+		set(tahuClient, "birthRetain", false);
+		set(tahuClient, "useSparkplugStatePayload", false);
 	}
 
 	private void startDrain() throws Exception {
