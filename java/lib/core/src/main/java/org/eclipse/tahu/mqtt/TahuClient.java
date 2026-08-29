@@ -87,8 +87,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 * everything else in the buffer, because the backoff sleeps the drain thread. At 500ms a message gets three
 	 * attempts spread over roughly 750ms of wall clock.
 	 *
-	 * MAX_BUFFERED_PUBLISH_ATTEMPTS remains as a backstop against a message that fails instantly in a tight loop
-	 * filling the log; the window is what normally decides.
+	 * MAX_BUFFERED_PUBLISH_ATTEMPTS and MAX_BUFFERED_PUBLISH_RETRY_DELAY cannot bind at these values, and that is
+	 * worth saying plainly rather than leaving a reader to work out why the attempt count never appears in a log.
+	 * The delay is min(POLL_INTERVAL * attempts, RETRY_DELAY), so the third failure always lands past a 500ms
+	 * window: attempts stop at 3, and reaching 10 of them would take 4250ms of backoff. They are kept because they
+	 * are the bounds that start to matter the moment the window or the backoff step is retuned - a shorter step
+	 * fits more attempts into the window, and the cap is what stops the last of them waiting longer than the window
+	 * itself. The window is what decides today.
 	 */
 	private static final long MAX_BUFFERED_PUBLISH_RETRY_WINDOW = 500;
 	private static final int MAX_BUFFERED_PUBLISH_ATTEMPTS = 10;
