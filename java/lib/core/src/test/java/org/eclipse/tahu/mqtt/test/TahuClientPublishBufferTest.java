@@ -50,7 +50,7 @@ import org.testng.annotations.Test;
 /**
  * Tests for the FIFO publish buffer added to {@link TahuClient}.
  *
- * IMM-5395 - MQTT Transmission UNS Transmitter Thread Explosion / OOM.
+ * Regression coverage for the UNS transmitter thread explosion and OOM.
  *
  * These exercise the class against a fake Paho client rather than a broker, so the in-flight window can be held at zero
  * deterministically - which is the state that used to deadlock the client permanently.
@@ -74,9 +74,9 @@ public class TahuClientPublishBufferTest {
 		if (tahuClient != null) {
 			/*
 			 * Bounded, because the shutdown needs publishOrderLock and a deadlock regression is exactly the state
-			 * where nobody can have it. Left unbounded, a client wedged the way IMM-5395 wedged it would hang the
-			 * JVM here and the run would die by CI timeout with no failing test named. This turns that into a
-			 * teardown failure that says which test wedged the client.
+			 * where nobody can have it. Left unbounded, a client wedged that way would hang the JVM here and the
+			 * run would die by CI timeout with no failing test named. This turns that into a teardown failure
+			 * that says which test wedged the client.
 			 */
 			Thread shutdown = new Thread(() -> {
 				try {
@@ -102,7 +102,7 @@ public class TahuClientPublishBufferTest {
 	// ------------------------------------------------------------------------------------------------------------
 
 	/**
-	 * The regression test for IMM-5395.
+	 * The regression test for the publish deadlock.
 	 *
 	 * With the window exhausted, publish() must return promptly instead of parking while holding messageLock. If this
 	 * hangs, the deadlock is back.
@@ -576,13 +576,13 @@ public class TahuClientPublishBufferTest {
 	}
 
 	// ------------------------------------------------------------------------------------------------------------
-	// Disconnect and the LWT (IMM-5460)
+	// Disconnect and the LWT
 	// ------------------------------------------------------------------------------------------------------------
 
 	/**
-	 * IMM-5460. The LWT is the only death certificate on a clean DISCONNECT, because the MQTT server suppresses the
-	 * Will. With the in-flight window exhausted the acknowledged publish would be buffered - and the buffer is torn
-	 * down moments later - so it must fall back to QoS 0 and actually leave the process.
+	 * The LWT is the only death certificate on a clean DISCONNECT, because the MQTT server suppresses the Will.
+	 * With the in-flight window exhausted the acknowledged publish would be buffered - and the buffer is torn down
+	 * moments later - so it must fall back to QoS 0 and actually leave the process.
 	 *
 	 * Asserts the fallback rather than the disconnect ordering: it calls publishLwt() directly, so it does not need a
 	 * connected Paho client to tear down.
@@ -616,9 +616,9 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
-	 * IMM-5460 / IMM-5458. The drain thread is started by connect() before the Paho client is built, so a disconnect
-	 * that finds no client still has one to stop. Moving the shutdown below the LWT publish put it inside the
-	 * 'client != null' arm, which is exactly how this path would have been left orphaned.
+	 * The drain thread is started by connect() before the Paho client is built, so a disconnect that finds no
+	 * client still has one to stop. Moving the shutdown below the LWT publish put it inside the 'client != null'
+	 * arm, which is exactly how this path would have been left orphaned.
 	 */
 	@Test(
 			timeOut = TIMEOUT_MS)
@@ -651,7 +651,7 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
-	 * IMM-5460 last resort. Every route to publishing the death certificate has failed, so a clean DISCONNECT would
+	 * Last resort. Every route to publishing the death certificate has failed, so a clean DISCONNECT would
 	 * suppress the Will and leave subscribers with nothing. The connection must drop instead, so the MQTT server
 	 * publishes the Will it already holds from connect().
 	 */
@@ -1450,7 +1450,7 @@ public class TahuClientPublishBufferTest {
 
 		/*
 		 * Recorded rather than performed. The real methods would throw on a client that never connected, and the
-		 * sendDisconnectPacket flag is the observable for the IMM-5460 Will escalation.
+		 * sendDisconnectPacket flag is the observable for the Will escalation.
 		 */
 		@Override
 		public void disconnectForcibly(long quiesceTimeout, long disconnectTimeout, boolean sendDisconnectPacket) {

@@ -195,19 +195,6 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * The maximum number of messages held in the FIFO publish buffer.
 	 *
-	 * A QoS > 0 publish needs an in-flight permit, and permits are only returned by deliveryComplete() when the MQTT
-	 * server ACKs a message. Rather than waiting for one - which is what deadlocked this client against
-	 * deliveryComplete() - a message that cannot get a permit immediately is buffered and sent by the drain thread once
-	 * a permit frees up. Once anything is buffered, every subsequent QoS > 0 message is buffered too, so they leave the
-	 * buffer in submission order on the happy path.
-	 *
-	 * That ordering is BEST EFFORT and is not a guarantee. See publishOrderLock below for where it does not hold, and
-	 * note that MQTT itself only orders messages when at most one is in flight - with maxInFlightMessages in the
-	 * thousands, acknowledged messages can already be reordered on the wire regardless of anything this class does.
-	 *
-	 * QoS 0 is never buffered - it needs no permit and is always published immediately, so it can overtake buffered
-	 * QoS > 0 messages during a stall.
-	 *
 	 * The buffer MUST stay bounded. An unbounded one only moves the failure from thread exhaustion to heap exhaustion
 	 * under a sustained server stall. At capacity the newest publish is rejected with a TahuException so the caller can
 	 * fall back to its own store-and-forward rather than lose the message silently.
@@ -259,8 +246,8 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * Counted separately from publishBufferRejectedMessageCount, because the two mean different things to whoever is
 	 * looking at them. A rejection is a refusal at the door: publish() threw, so the caller knows and can store the
-	 * message itself. A discard is a message this client accepted - publish() returned null, which the contract
-	 * defines as "queued, not lost" - and then threw away. Only the second is a loss the caller could not see coming.
+	 * message itself. A discard is a message this client accepted - publish() returned null, meaning queued rather
+	 * than lost - and then threw away. Only the second is a loss the caller could not see coming.
 	 */
 	private long publishBufferDiscardedMessageCount;
 
@@ -293,8 +280,8 @@ public class TahuClient implements MqttCallbackExtended {
 	private volatile boolean disconnectInProgress = false;
 
 	/*
-	 * IMM-5460. Set by publishLwt() so disconnect() can tell whether the death certificate actually reached the MQTT
-	 * client. False means every attempt failed, including the QoS 0 fallback - and the only remaining way to get one
+	 * Set by publishLwt() so disconnect() can tell whether the death certificate actually reached the MQTT client.
+	 * False means every attempt failed, including the QoS 0 fallback - and the only remaining way to get one
 	 * published is to let the MQTT server publish the Will, which means NOT sending a DISCONNECT packet.
 	 */
 	private volatile boolean lwtPublishSucceeded = true;
@@ -776,7 +763,7 @@ public class TahuClient implements MqttCallbackExtended {
 	 * Decides - atomically with respect to the buffer - whether a message is published now or queued.
 	 *
 	 * The whole decision runs under {@link #publishOrderLock} so that a message cannot overtake one already queued -
-	 * except across a failed buffered send, which that field documents as an accepted gap. It
+	 * except across a failed buffered send, where the lock is released between the failure and the re-queue. It
 	 * NEVER waits for a permit while holding a lock: the inline path uses a non-blocking {@link Semaphore#tryAcquire()}
 	 * and falls back to buffering. That is what keeps {@link #deliveryComplete(IMqttDeliveryToken)} - which needs only
 	 * {@link #messageLock} - able to return permits at all times.
@@ -787,12 +774,11 @@ public class TahuClient implements MqttCallbackExtended {
 	private IMqttDeliveryToken publishOrBuffer(String topic, byte[] payload, int qos, boolean retained)
 			throws TahuException {
 		/*
-		 * QoS 0 takes no permit and is never subject to backpressure, so it is always sent immediately - it is never
-		 * buffered, even while QoS > 0 messages are queued. This means a QoS 0 message CAN overtake buffered QoS > 0
-		 * messages during a stall. That is deliberate: MQTT only orders within a QoS level, and holding live
-		 * fire-and-forget data behind a stalled acknowledged queue would make it stale for no delivery benefit.
+		 * A QoS 0 message can go out ahead of buffered QoS > 0 ones during a stall. That is deliberate: MQTT only
+		 * orders within a QoS level, and holding live fire-and-forget data behind a stalled acknowledged queue would
+		 * make it stale for no delivery benefit.
 		 *
-		 * Deliberately OUTSIDE publishOrderLock, and it has to be for any of the above to be true. The drain thread
+		 * Deliberately OUTSIDE publishOrderLock, and it has to be for that to hold at all. The drain thread
 		 * holds that monitor across client.publish() for every buffered message, and Java monitors are not fair, so a
 		 * QoS 0 publisher that took it would queue behind the drain rather than slot in between its iterations -
 		 * measured at 500-900ms against a five message backlog, and it scales with buffer depth. This path touches
@@ -915,8 +901,8 @@ public class TahuClient implements MqttCallbackExtended {
 	 * A message is also rejected when no drain thread owns the buffer, for the same reason as a full one: nothing
 	 * would ever send it. That state is not reachable during a live session - connect() starts the drain before the
 	 * Paho client exists, and publish() cannot get here with no client - so it means the disconnect is already
-	 * tearing this client down. Accepting there would return null, which publish() defines as "queued, not lost",
-	 * for a message certain to be discarded by the disconnect that is already running.
+	 * tearing this client down. Accepting there would return null - telling the caller the message is queued rather
+	 * than lost - for a message certain to be discarded by the disconnect that is already running.
 	 */
 	private void bufferPublish(String topic, byte[] payload, int qos, boolean retained, String reason)
 			throws TahuException {
@@ -997,15 +983,15 @@ public class TahuClient implements MqttCallbackExtended {
 	/**
 	 * @return the number of buffered publishes this client accepted and then did not send, for the life of this
 	 *         client. Every one of them is lost data the caller could not see coming, because
-	 *         {@link #publish(String, byte[], int, boolean)} returned null - "queued, not lost" - before the loss
-	 *         happened. Two routes reach it:
+	 *         {@link #publish(String, byte[], int, boolean)} returned null - queued rather than lost - before the
+	 *         loss happened. Two routes reach it:
 	 *         <ul>
 	 *         <li>a buffered message dropped once its retry window is spent - see requeueOrDrop();</li>
 	 *         <li>the whole buffer discarded at disconnect, counted by the number of entries cleared. Since
 	 *         connect() disconnects first, an ordinary reconnect takes this route: a queued message must not be
 	 *         replayed onto the next session, so it is discarded here and counted.</li>
 	 *         </ul>
-	 *         IMM-5456 covers giving the caller a way to store these rather than lose them.
+	 *         There is currently no way for the caller to store these rather than lose them.
 	 */
 	public long getPublishBufferDiscardedMessageCount() {
 		synchronized (publishOrderLock) {
@@ -1203,7 +1189,7 @@ public class TahuClient implements MqttCallbackExtended {
 	 * gave them no time to do.
 	 *
 	 * NOTE: the caller has already left the publishOrderLock block by the time this runs, so a concurrent publisher can
-	 * slip in ahead of the message being re-queued. That reordering is an accepted gap - see publishOrderLock - so
+	 * slip in ahead of the message being re-queued. That reordering is accepted rather than prevented, so
 	 * "back at the head" means ahead of everything still queued, not ahead of everything published after the failure.
 	 *
 	 * The drain is passed in so this can refuse to re-queue into a buffer it no longer owns. publishWithPermit()
@@ -1264,7 +1250,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 	/*
 	 * Drains the publish buffer head first as in-flight permits become available. FIFO on the happy path only - a failed
-	 * send can be overtaken while it is re-queued, which publishOrderLock documents as an accepted gap.
+	 * send can be overtaken while it is re-queued.
 	 *
 	 * Permits are acquired WITHOUT holding publishOrderLock - only the dequeue-and-publish step takes it - so this
 	 * thread can never block a caller or deliveryComplete().
@@ -1626,9 +1612,9 @@ public class TahuClient implements MqttCallbackExtended {
 				try {
 					if (publishLwt) {
 						/*
-						 * IMM-5460 - give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out
-						 * inline at its configured QoS and be acknowledged. The drain thread is still running at this
-						 * point; it is stopped below, after the LWT.
+						 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
+						 * configured QoS and be acknowledged. The drain thread is still running at this point; it is
+						 * stopped below, after the LWT.
 						 *
 						 * Only when there is an LWT to protect, and only when the client could still send it. This
 						 * used to run on every disconnect: for a caller passing publishLwt=false there was nothing
@@ -1655,13 +1641,13 @@ public class TahuClient implements MqttCallbackExtended {
 						}
 
 						/*
-						 * IMM-5460 - last resort. No acknowledged death certificate was published: either every
-						 * attempt failed, or it went out downgraded to QoS 0 and carries no guarantee. A clean
-						 * DISCONNECT would tell the MQTT server we left gracefully and suppress the Will, leaving
-						 * subscribers with nothing better than that unacknowledged publish - so drop the connection
-						 * instead and let the server publish the Will it already holds from connect(). That Will is
-						 * QoS 1 and retained, so it is strictly the stronger of the two, and an identical retained
-						 * payload arriving twice is harmless.
+						 * Last resort. No acknowledged death certificate was published: either every attempt failed,
+						 * or it went out downgraded to QoS 0 and carries no guarantee. A clean DISCONNECT would tell
+						 * the MQTT server we left gracefully and suppress the Will, leaving subscribers with nothing
+						 * better than that unacknowledged publish - so drop the connection instead and let the server
+						 * publish the Will it already holds from connect(). That Will is QoS 1 and retained, so it is
+						 * strictly the stronger of the two, and an identical retained payload arriving twice is
+						 * harmless.
 						 */
 						if (sendDisconnectPacket && !lwtPublishSucceeded) {
 							logger.warn("{}: Could not publish the LWT on {} by any route - closing without a "
@@ -1672,10 +1658,10 @@ public class TahuClient implements MqttCallbackExtended {
 					}
 
 					/*
-					 * IMM-5460 - deliberately AFTER the LWT and BEFORE disconnectForcibly(). The drain thread has to
-					 * be alive for a buffered LWT to reach the MQTT server at all, and dead before the client is
-					 * closed, or it publishes into a client that is going away. It also clears the buffer, so
-					 * anything still queued at this point is discarded - see IMM-5456.
+					 * Deliberately AFTER the LWT and BEFORE disconnectForcibly(). The drain thread has to be alive
+					 * for a buffered LWT to reach the MQTT server at all, and dead before the client is closed, or
+					 * it publishes into a client that is going away. It also clears the buffer, so anything still
+					 * queued at this point is discarded and counted by getPublishBufferDiscardedMessageCount().
 					 */
 					shutdownPublishBufferDrainThreadQuietly();
 
@@ -1705,9 +1691,10 @@ public class TahuClient implements MqttCallbackExtended {
 				logger.debug("{}: Disconnect: Client is already null", getClientId());
 
 				/*
-				 * IMM-5460 - the drain thread is started by connect() before the Paho client is built, so a
-				 * disconnect with no client still has one to stop. Without this it would be orphaned - the defect
-				 * IMM-5458 describes, reached through a different door.
+				 * The drain thread is started by connect() before the Paho client is built, so a disconnect with
+				 * no client still has one to stop. Without this it would be left running with no owner, holding
+				 * its TahuClient and everything queued in its buffer from garbage collection - the same orphan
+				 * that any teardown bypassing disconnect() leaves behind.
 				 */
 				shutdownPublishBufferDrainThreadQuietly();
 			}
@@ -2078,9 +2065,9 @@ public class TahuClient implements MqttCallbackExtended {
 
 		/**
 		 * @return true if the client took responsibility for the message - either sent inline or queued in the
-		 *         publish buffer, which {@link #publish(String, byte[], int, boolean)} signals with a null token and
-		 *         defines as "queued, not lost". False only if it was rejected outright and nothing holds it, which
-		 *         is the one outcome worth another attempt.
+		 *         publish buffer, which {@link #publish(String, byte[], int, boolean)} signals with a null token -
+		 *         queued rather than lost. False only if it was rejected outright and nothing holds it, which is the
+		 *         one outcome worth another attempt.
 		 */
 		private boolean handlePublish() throws Exception {
 			try {
@@ -2456,10 +2443,10 @@ public class TahuClient implements MqttCallbackExtended {
 	/**
 	 * Publishes the LWT at its configured QoS, falling back to QoS 0 if the acknowledged path cannot take it.
 	 *
-	 * IMM-5460. The LWT is the last thing this client sends, the publish buffer is torn down moments later, and on a
-	 * clean DISCONNECT the MQTT server suppresses the Will - so the explicit publish is the only death certificate
-	 * there will be. A buffered or rejected LWT is therefore as good as lost, where for ordinary data either outcome
-	 * is recoverable.
+	 * The LWT is the last thing this client sends, the publish buffer is torn down moments later, and on a clean
+	 * DISCONNECT the MQTT server suppresses the Will - so the explicit publish is the only death certificate there
+	 * will be. A buffered or rejected LWT is therefore as good as lost, where for ordinary data either outcome is
+	 * recoverable.
 	 *
 	 * The backpressure check happens BEFORE publishing, not after. {@link #publishOrBuffer(String, byte[], int,
 	 * boolean)} appends to the buffer and then returns null, so reacting to the null afterwards would leave a queued
