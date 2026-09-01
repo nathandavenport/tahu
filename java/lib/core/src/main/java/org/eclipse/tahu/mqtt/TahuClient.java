@@ -262,6 +262,14 @@ public class TahuClient implements MqttCallbackExtended {
 	private PublishBufferDrain publishBufferDrain;
 	private Thread publishBufferDrainThread;
 
+	/*
+	 * Retrying or escalating a BIRTH must not happen on the thread that delivers the acknowledgements it is waiting
+	 * for. Paho dispatches deliveryComplete(), messageArrived() and connectComplete() from a single callback thread,
+	 * and two of the three routes into publishBirthMessage() arrive on it - so a wait taken there blocks the only
+	 * thread that could satisfy it, and a teardown taken there re-enters connect() from inside connectComplete().
+	 */
+	private Thread birthRecoveryThread;
+
 	private Date connectTime;
 	private Date disconnectTime;
 	private Date onlineDate;
@@ -1610,24 +1618,27 @@ public class TahuClient implements MqttCallbackExtended {
 			if (client != null) {
 				boolean sendDisconnectPacket = sendDisconnect;
 				try {
-					if (publishLwt) {
-						/*
-						 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
-						 * configured QoS and be acknowledged. The drain thread is still running at this point; it is
-						 * stopped below, after the LWT.
-						 *
-						 * Only when there is an LWT to protect, and only when the client could still send it. This
-						 * used to run on every disconnect: for a caller passing publishLwt=false there was nothing
-						 * to wait for, and with the socket already down the wait could not succeed at all - the
-						 * drain declines to publish while the client is disconnected, so the poll ran to the
-						 * deadline and publishLwt() then skipped the LWT anyway. Measured at 2011ms of dead time
-						 * with nothing published, all of it holding clientLock, on the path connect() takes before
-						 * every reconnect attempt.
-						 */
-						if (client.isConnected()) {
-							awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
-						}
+					/*
+					 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
+					 * configured QoS and be acknowledged. The drain thread is still running at this point; it is
+					 * stopped below, after the LWT.
+					 *
+					 * Guarded on isConnected() and nothing else. With the socket already down the wait cannot
+					 * succeed - the drain declines to publish while the client is disconnected, so the poll ran to
+					 * the deadline and publishLwt() then skipped the LWT anyway, measured at 2011ms of dead time
+					 * holding clientLock on the path connect() takes before every reconnect attempt.
+					 *
+					 * Deliberately NOT also scoped to publishLwt. shutdownPublishBufferDrainThreadQuietly() below
+					 * runs on every disconnect and discards the buffer unconditionally, so a still-connected client
+					 * disconnecting with publishLwt=false would lose an accepted backlog with no chance to flush it -
+					 * and publish() returning null told those callers the messages were queued, not lost. The LWT is
+					 * the reason the wait happens first, not the reason it happens.
+					 */
+					if (client.isConnected()) {
+						awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
+					}
 
+					if (publishLwt) {
 						/*
 						 * A failed LWT publish must not abort the disconnect. Only MqttException is handled below, so
 						 * letting a TahuException out here would skip disconnectForcibly() and close() while the
@@ -2364,78 +2375,163 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	public void publishBirthMessage() {
 		synchronized (clientLock) {
-			if (birthTopic != null && client.isConnected()) {
+			/*
+			 * client is null checked as well as birthTopic. The escalation below tears the session down through
+			 * disconnect(), which clears the client field, so a second call - setOnlineState() after a teardown, say -
+			 * would otherwise dereference null here. publishLwt() guards the same way.
+			 */
+			if (birthTopic == null || client == null || !client.isConnected()) {
+				return;
+			}
+
+			/*
+			 * The two conditions publishOrBuffer() buffers on. Reached from setOnlineState() mid-session, where the
+			 * window can be exhausted; connect() rebuilds the semaphore before the client exists, so the
+			 * connectComplete() route always finds a full window and an empty buffer.
+			 *
+			 * Both are the ordinary backpressure the buffer exists to absorb and both clear on the next
+			 * acknowledgement, so a moment's wait is worth taking rather than letting a message queued for
+			 * milliseconds cost the whole session. That wait is taken on a worker: see birthRecoveryThread.
+			 */
+			if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
+				startBirthRecovery(true);
+				return;
+			}
+
+			try {
+				publishBirth();
+			} catch (TahuException ce) {
+				logger.error("{}: Error in birth topic publish on connect", getClientId(), ce);
+				startBirthRecovery(false);
+			}
+		}
+	}
+
+	/**
+	 * Publishes the BIRTH inline. Callers must hold {@link #clientLock} and must have established that there is a
+	 * client, a birth topic and a publishable window.
+	 *
+	 * @throws TahuException if the BIRTH could not be handed to the MQTT client
+	 */
+	private void publishBirth() throws TahuException {
+		synchronized (clientLock) {
+			if (useSparkplugStatePayload) {
+				byte[] payload;
 				try {
-					/*
-					 * The two conditions publishOrBuffer() buffers on. Reached from setOnlineState() mid-session,
-					 * where the window can be exhausted; connect() rebuilds the semaphore before the client exists,
-					 * so the connectComplete() route always finds a full window and an empty buffer.
-					 *
-					 * Give it a moment first. Both conditions are the ordinary backpressure the buffer exists to
-					 * absorb and both clear on the next acknowledgement, so testing once and giving up meant a
-					 * single message queued for milliseconds cost the whole session.
-					 */
-					if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
-						awaitPublishableWindow(BIRTH_BACKPRESSURE_WAIT);
-					}
+					ObjectMapper mapper = new ObjectMapper();
+					StatePayload statePayload = new StatePayload(true, lastStateDeathPayloadTimestamp);
+					logger.debug("{}: Publishing Sparkplug BIRTH on {} with retain={} and payload: {}", getClientId(),
+							birthTopic, birthRetain, statePayload);
+					payload = mapper.writeValueAsString(statePayload).getBytes();
+				} catch (Exception e) {
+					// Reconnecting cannot fix a payload that will not encode, so there is nothing to recover
+					logger.error("{}: Failed to encode the BIRTH message on {}", getClientId(), birthTopic, e);
+					return;
+				}
 
-					if (getAvailablePublishPermits() == 0 || getPublishBufferDepth() > 0) {
-						throw new TahuException(TahuErrorCode.INTERNAL_ERROR,
-								"MQTT client: " + clientId.getMqttClientId() + " cannot publish the BIRTH on "
-										+ birthTopic + " without queueing it behind buffered messages - "
-										+ getAvailablePublishPermits() + " permits free, buffer depth "
-										+ getPublishBufferDepth());
-					}
+				/*
+				 * Deliberately outside the encode handler above - a failed publish must reach the caller's recovery
+				 * rather than being logged and swallowed.
+				 */
+				publish(birthTopic, payload, MqttOperatorDefs.QOS1, birthRetain);
+			} else {
+				logger.debug("{}: Publishing BIRTH on {} with retain={}", getClientId(), birthTopic, birthRetain);
+				publish(birthTopic, birthPayload, MqttOperatorDefs.QOS1, birthRetain);
+			}
+		}
+	}
 
-					if (useSparkplugStatePayload) {
-						byte[] payload;
-						try {
-							ObjectMapper mapper = new ObjectMapper();
-							StatePayload statePayload = new StatePayload(true, lastStateDeathPayloadTimestamp);
-							logger.debug("{}: Publishing Sparkplug BIRTH on {} with retain={} and payload: {}",
-									getClientId(), birthTopic, birthRetain, statePayload);
-							payload = mapper.writeValueAsString(statePayload).getBytes();
-						} catch (Exception e) {
-							// Reconnecting cannot fix a payload that will not encode, so there is nothing to recover
-							logger.error("{}: Failed to encode the BIRTH message on {}", getClientId(), birthTopic, e);
-							return;
-						}
+	/**
+	 * Starts the off-thread BIRTH recovery: optionally waits for a publishable window and retries, and tears the
+	 * session down if the BIRTH still cannot go out.
+	 *
+	 * Always on a worker, never on the calling thread. Two of the three routes into {@link #publishBirthMessage()} -
+	 * connectComplete() and the STATE correction in the host callback - arrive on Paho's single callback thread, and
+	 * that is the thread deliveryComplete() runs on. Waiting there blocks the only thread that could return the
+	 * permit being waited for, and tearing down there re-enters connect() from inside connectComplete().
+	 *
+	 * @param awaitWindow true to wait for the backpressure to clear and retry, false to escalate immediately
+	 */
+	private void startBirthRecovery(boolean awaitWindow) {
+		synchronized (clientLock) {
+			if (birthRecoveryThread != null && birthRecoveryThread.isAlive()) {
+				// One recovery per session. A second would race the first through disconnect().
+				logger.debug("{}: BIRTH recovery already running", getClientId());
+				return;
+			}
 
-						/*
-						 * Deliberately outside the encode handler above - a failed publish must reach the recovery
-						 * below rather than being logged and swallowed.
-						 */
-						publish(birthTopic, payload, MqttOperatorDefs.QOS1, birthRetain);
-					} else {
-						logger.debug("{}: Publishing BIRTH on {} with retain={}", getClientId(), birthTopic,
-								birthRetain);
-						publish(birthTopic, birthPayload, MqttOperatorDefs.QOS1, birthRetain);
-					}
-				} catch (TahuException ce) {
-					/*
-					 * Covers both a failed publish and a BIRTH that backpressure never cleared for: in either case
-					 * no BIRTH reached the MQTT server, so the session must not be left announcing itself online.
-					 *
-					 * Through disconnect() rather than a bare disconnectForcibly(), so the session is torn down by
-					 * the one path that does it completely - the drain stopped and its buffer discarded and counted,
-					 * the Paho client closed rather than leaked, the client field cleared. Dropping only the socket
-					 * left the buffer, the drain thread and a closed client behind for the next disconnect to find.
-					 *
-					 * sendDisconnect false so the MQTT server publishes the Will rather than treating this as a
-					 * graceful exit, and publishLwt false because there is no acknowledged death to send from a
-					 * session that never announced itself - the Will is the better carrier and this avoids
-					 * re-entering the LWT machinery from Paho's callback thread.
-					 *
-					 * Recovery is the caller's: the modules that own these clients poll isConnected() in their own
-					 * run loops, so it does not depend on the ConnectionMonitor this tears down.
-					 */
-					logger.error("{}: Error in birth topic publish on connect", getClientId(), ce);
+			birthRecoveryThread = new Thread(new BirthRecovery(awaitWindow),
+					"TahuBirthRecovery-" + getClientId().getMqttClientId());
+			birthRecoveryThread.setDaemon(true);
+			birthRecoveryThread.start();
+		}
+	}
+
+	private class BirthRecovery implements Runnable {
+
+		private final boolean awaitWindow;
+
+		BirthRecovery(boolean awaitWindow) {
+			this.awaitWindow = awaitWindow;
+		}
+
+		@Override
+		public void run() {
+			// Outside clientLock: the permit this waits for is returned by deliveryComplete(), which needs it too.
+			if (awaitWindow) {
+				awaitPublishableWindow(BIRTH_BACKPRESSURE_WAIT);
+			}
+
+			boolean tornDown = false;
+			synchronized (clientLock) {
+				if (birthTopic == null || client == null || !client.isConnected()) {
+					// The session went away while we waited - there is no BIRTH to publish and nothing to tear down.
+					return;
+				}
+
+				if (awaitWindow && getAvailablePublishPermits() > 0 && getPublishBufferDepth() == 0) {
 					try {
-						disconnect(0, 1, false, false, false);
-					} catch (Exception e) {
-						logger.error("{}: Failed to disconnect after failed BIRTH publish", getClientId(), e);
+						publishBirth();
+						return;
+					} catch (TahuException ce) {
+						logger.error("{}: BIRTH publish failed after the window opened", getClientId(), ce);
 					}
 				}
+
+				/*
+				 * No BIRTH reached the MQTT server, so the session must not be left announcing itself online.
+				 *
+				 * Through disconnect() rather than a bare disconnectForcibly(), so the session is torn down by the
+				 * one path that does it completely - the drain stopped and its buffer discarded and counted, the
+				 * Paho client closed rather than leaked, the client field cleared.
+				 *
+				 * sendDisconnect false so the MQTT server publishes the Will rather than treating this as a graceful
+				 * exit, and publishLwt false because there is no acknowledged death to send from a session that never
+				 * announced itself - the Will is the better carrier.
+				 */
+				logger.error("{}: Could not publish the BIRTH on {} - tearing the session down", getClientId(),
+						birthTopic);
+				try {
+					disconnect(0, 1, false, false, false);
+					tornDown = true;
+				} catch (Exception e) {
+					logger.error("{}: Failed to disconnect after failed BIRTH publish", getClientId(), e);
+				}
+			}
+
+			/*
+			 * Re-arm recovery, outside clientLock so the callback's connect() is not entered holding it.
+			 *
+			 * disconnect() is what makes this necessary: it stops the connection monitor, stops the connect runnable
+			 * and clears the client field, and a locally requested disconnect produces no connectionLost from Paho -
+			 * ClientComms.shutdownConnection passes a null cause, and CommsCallback only forwards a non-null one. A
+			 * host application whose only reconnect is the connectionLost callback would otherwise stay offline for
+			 * good, with a retained offline STATE on its topic. Clients that poll isConnected() in their own run
+			 * loop are unaffected either way.
+			 */
+			if (tornDown) {
+				getCallback().connectionLost(getMqttServerName(), getMqttServerUrl(), getClientId(),
+						new Throwable("BIRTH publish failed"));
 			}
 		}
 	}

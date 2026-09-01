@@ -28,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
 import org.eclipse.paho.client.mqttv3.IMqttAsyncClient;
@@ -62,10 +63,12 @@ public class TahuClientPublishBufferTest {
 
 	private TahuClient tahuClient;
 	private FakeMqttClient fakeClient;
+	private RecordingCallback callback;
 
 	@BeforeMethod
 	public void setUp() throws Exception {
-		tahuClient = newTahuClient();
+		callback = new RecordingCallback();
+		tahuClient = newTahuClient(callback);
 		fakeClient = new FakeMqttClient();
 	}
 
@@ -877,9 +880,82 @@ public class TahuClientPublishBufferTest {
 				"No BIRTH reached the MQTT server, so none may be reported as sent");
 		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0,
 				"A queued BIRTH would be delivered late, out of session, or dropped - it must not be queued at all");
-		Assert.assertTrue(fakeClient.disconnectForciblyCalled,
+		awaitTrue(() -> fakeClient.disconnectForciblyCalled,
 				"With no BIRTH on the wire the session must be dropped so connect() can publish one on a fresh "
 						+ "session, which is the recovery the exception path already performs");
+	}
+
+	/**
+	 * The teardown re-arms recovery, because disconnect() is what removes it.
+	 *
+	 * disconnect() stops the connection monitor, stops the connect runnable and clears the client field, and Paho
+	 * raises no connectionLost for a locally requested disconnect - ClientComms.shutdownConnection passes a null
+	 * cause and CommsCallback forwards only a non-null one. A host application whose only reconnect is the
+	 * connectionLost callback would otherwise never reconnect, leaving a retained offline STATE on its topic.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theBirthTeardownReArmsTheConnectionLostCallback() throws Exception {
+		wire(0, 8);
+		configureBirth();
+
+		tahuClient.publishBirthMessage();
+
+		awaitTrue(() -> callback.connectionLostCount.get() == 1,
+				"The teardown must fire connectionLost once, since Paho fires none for a local disconnect");
+		Assert.assertNotNull(callback.lastCause.get(),
+				"The cause must be non-null - TahuHostCallback only reconnects on a forwarded callback");
+	}
+
+	/**
+	 * A second BIRTH after a teardown must not throw.
+	 *
+	 * The guard was birthTopic != null && client.isConnected(), with no null check on the client. The previous
+	 * escalation left the field pointing at a closed Paho client, so the guard read false and a second call was a
+	 * harmless no-op; disconnect() clears the field instead, so the same call dereferenced null while holding
+	 * clientLock. HostApplication.setOnlineState() iterates every client, so one dead client took the rest with it.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aBirthAfterTheSessionIsTornDownIsANoOp() throws Exception {
+		wire(0, 8);
+		configureBirth();
+		tahuClient.publishBirthMessage();
+		awaitTrue(() -> fakeClient.disconnectForciblyCalled, "Precondition: the session must be torn down first");
+		awaitTrue(() -> {
+			try {
+				return get(tahuClient, "client") == null;
+			} catch (Exception e) {
+				return false;
+			}
+		}, "Precondition: disconnect() must have cleared the client field");
+
+		tahuClient.publishBirthMessage();
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"With no client there is nothing to publish and nothing to throw");
+	}
+
+	/**
+	 * The BIRTH retry must not run on the thread that would satisfy it.
+	 *
+	 * Paho dispatches deliveryComplete(), messageArrived() and connectComplete() from one callback thread, and two
+	 * of the three routes into publishBirthMessage() arrive on it. A wait taken there blocks the only thread that
+	 * could release the permit being waited for, so it always runs to its deadline - 500ms of frozen callback
+	 * dispatch, all of it holding clientLock, before escalating exactly as it would have anyway.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theBirthRetryDoesNotBlockTheCallingThread() throws Exception {
+		wire(0, 8);
+		configureBirth();
+
+		long start = System.currentTimeMillis();
+		tahuClient.publishBirthMessage();
+		long elapsed = System.currentTimeMillis() - start;
+
+		Assert.assertTrue(elapsed < 250, "publishBirthMessage() blocked its caller for " + elapsed + "ms - on the "
+				+ "production callers that is Paho's callback thread, which is what would clear the backpressure");
 	}
 
 	/** With a permit free, the BIRTH goes out inline and the session stands. */
@@ -980,26 +1056,30 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
-	 * A disconnect that publishes no LWT has nothing to wait for.
+	 * A still-connected disconnect gets its bounded flush even when it publishes no LWT.
 	 *
-	 * The wait sat above the publishLwt guard, so a caller passing false paid it too - EdgeClient does exactly that.
-	 * Measured through a full disconnect() with a stuck buffer: 3012ms before, 1001ms after, the residue being the
-	 * unconditional Paho workaround sleep that is not part of this change.
+	 * The futile-wait fix is the isConnected() guard, covered by the test above. Scoping the wait to publishLwt as
+	 * well removed the flush window from every caller passing false - EdgeClient.handleStateMessage() does exactly
+	 * that, on any offline STATE for the configured primary host, which a peer can publish. The drain shutdown below
+	 * discards the buffer unconditionally, and publish() returning null had told those callers their messages were
+	 * queued rather than lost, so there is no way for them to know or retry.
 	 */
 	@Test(
 			timeOut = TIMEOUT_MS * 2)
-	public void aDisconnectWithNoLwtDoesNotWaitForTheBuffer() throws Exception {
+	public void aConnectedDisconnectWithNoLwtStillFlushesTheBuffer() throws Exception {
 		wire(0, 8);
 		for (int i = 0; i < 3; i++) {
 			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
 		}
+		awaitBufferDepth(3);
+		releasePermits(3);
 
-		long start = System.currentTimeMillis();
 		tahuClient.disconnect(0, 1, false, false, false);
-		long elapsed = System.currentTimeMillis() - start;
 
-		Assert.assertTrue(elapsed < 2000, "A disconnect that publishes no LWT waited " + elapsed + "ms for a buffer "
-				+ "it has no reason to drain");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 0,
+				"Accepted messages must get their bounded flush before the drain shutdown discards the buffer");
+		Assert.assertEquals(fakeClient.publishedTopics().size(), 3,
+				"All three queued messages must reach the MQTT server, not be discarded unsent");
 	}
 
 	/**
@@ -1074,19 +1154,24 @@ public class TahuClientPublishBufferTest {
 
 		tahuClient.setOnlineState(true);
 
-		Assert.assertTrue(fakeClient.publishedTopics().contains(BIRTH_TOPIC),
+		awaitTrue(() -> fakeClient.publishedTopics().contains(BIRTH_TOPIC),
 				"The BIRTH must go out once the window opens, not tear the session down while it is closed");
 		Assert.assertFalse(fakeClient.disconnectForciblyCalled,
 				"Backpressure that clears within the budget is not a reason to drop the connection");
+		Assert.assertEquals(callback.connectionLostCount.get(), 0,
+				"A session that recovered was never torn down, so recovery must not be re-armed");
 	}
 
 	/**
 	 * Backpressure that does not clear still refuses the BIRTH - and tears the session down cleanly.
 	 *
 	 * The escalation used to drop the socket and leave everything else: buffer intact, drain thread still
-	 * registered, client field still pointing at a closed Paho client. That last one is why recovery took so long -
-	 * ConnectionMonitor jumps a null client straight to its trigger, where a non-null closed one counts five 10
-	 * second intervals to get there.
+	 * registered, client field still pointing at a closed Paho client.
+	 *
+	 * The teardown is what recovery has to be re-armed after, not what performs it. disconnect() stops the
+	 * connection monitor, so nothing is left to observe the cleared client field - the monitor holds its own final
+	 * reference captured at construction and never reads this one. theBirthTeardownReArmsTheConnectionLostCallback
+	 * covers the mechanism that does bring the client back.
 	 */
 	@Test(
 			timeOut = TIMEOUT_MS)
@@ -1097,11 +1182,11 @@ public class TahuClientPublishBufferTest {
 
 		tahuClient.setOnlineState(true);
 
+		awaitTrue(() -> fakeClient.disconnectForciblyCalled, "The session must not be left announcing itself");
 		Assert.assertFalse(fakeClient.publishedTopics().contains(BIRTH_TOPIC),
 				"No BIRTH reached the MQTT server, so none may be reported as sent");
-		Assert.assertTrue(fakeClient.disconnectForciblyCalled, "The session must not be left announcing itself");
 		Assert.assertNull(get(tahuClient, "publishBufferDrain"), "The drain thread must not outlive the session");
-		Assert.assertNull(get(tahuClient, "client"), "A null client is what ConnectionMonitor recovers from fastest");
+		Assert.assertNull(get(tahuClient, "client"), "The session is gone, so the client field must not outlive it");
 		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 0, "The buffer must not outlive the session");
 		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 1,
 				"What was queued is lost data and must be counted, not silently dropped");
@@ -1340,9 +1425,26 @@ public class TahuClientPublishBufferTest {
 		Assert.fail("Buffer depth never reached " + expected + " (currently " + tahuClient.getPublishBufferDepth() + ")");
 	}
 
-	private static TahuClient newTahuClient() throws Exception {
+	private static TahuClient newTahuClient(ClientCallback clientCallback) throws Exception {
 		return new TahuClient(new MqttClientId("test-client", false), new MqttServerName("test-server"),
-				new MqttServerUrl("tcp://localhost:1883"), null, null, true, 30, new NoOpCallback(), null, false);
+				new MqttServerUrl("tcp://localhost:1883"), null, null, true, 30, clientCallback, null, false);
+	}
+
+	/**
+	 * Polls for a condition the BIRTH recovery worker satisfies asynchronously.
+	 *
+	 * The retry and the teardown moved off the calling thread, so publishBirthMessage() returns before either has
+	 * happened. Asserting immediately after it would test the handoff rather than the outcome.
+	 */
+	private void awaitTrue(BooleanSupplier condition, String message) throws Exception {
+		long deadline = System.currentTimeMillis() + TIMEOUT_MS - 500;
+		while (System.currentTimeMillis() < deadline) {
+			if (condition.getAsBoolean()) {
+				return;
+			}
+			Thread.sleep(10);
+		}
+		Assert.fail(message);
 	}
 
 	private static void set(Object target, String fieldName, Object value) throws Exception {
@@ -1582,6 +1684,20 @@ public class TahuClientPublishBufferTest {
 		@Override
 		public MqttWireMessage getResponse() {
 			return null;
+		}
+	}
+
+	/** Counts the connectionLost re-arm the BIRTH teardown fires, since a local disconnect produces none from Paho. */
+	private static class RecordingCallback extends NoOpCallback {
+
+		private final AtomicInteger connectionLostCount = new AtomicInteger();
+		private final AtomicReference<Throwable> lastCause = new AtomicReference<>();
+
+		@Override
+		public void connectionLost(MqttServerName mqttServerName, MqttServerUrl mqttServerUrl, MqttClientId clientId,
+				Throwable cause) {
+			lastCause.set(cause);
+			connectionLostCount.incrementAndGet();
 		}
 	}
 
