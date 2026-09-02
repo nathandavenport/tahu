@@ -107,10 +107,9 @@ public class TahuClient implements MqttCallbackExtended {
 	 * often it looks. An exhausted window or a queued message is the ordinary condition the publish buffer exists to
 	 * absorb and it clears on the next acknowledgement, so refusing immediately tore sessions down over a blip.
 	 *
-	 * The poll is deliberately fine grained. This runs inside synchronized (clientLock) - every caller already holds
-	 * it - and Thread.sleep() does not release a monitor, so the interval is not about contention, which is the same
-	 * either way. It is about how long the lock is held to notice something that has already resolved: at 50ms a
-	 * transient blip costs about that, where a coarser poll would hold the lock far longer to observe the same thing.
+	 * The poll is deliberately fine grained. The wait runs on the BIRTH recovery worker with clientLock released, so
+	 * the interval is not about lock hold time; it is about how quickly a blip that has already cleared is noticed,
+	 * since the whole budget is spent before the session is given up on.
 	 */
 	private static final long BIRTH_BACKPRESSURE_WAIT = 500;
 	private static final long BIRTH_BACKPRESSURE_POLL = 50;
@@ -269,6 +268,7 @@ public class TahuClient implements MqttCallbackExtended {
 	 * thread that could satisfy it, and a teardown taken there re-enters connect() from inside connectComplete().
 	 */
 	private Thread birthRecoveryThread;
+	private TahuMqttAsyncClient birthRecoverySession;
 
 	private Date connectTime;
 	private Date disconnectTime;
@@ -1064,9 +1064,10 @@ public class TahuClient implements MqttCallbackExtended {
 	 * Waits, bounded, for the client to be able to publish inline again - a free in-flight permit and an empty
 	 * buffer, the two conditions publishOrBuffer() would otherwise buffer on.
 	 *
-	 * The caller holds clientLock and this does not release it, so the budget is a deliberate ceiling on how long
-	 * everything else on that lock is held up. It returns the moment the window opens, and gives up early if the
-	 * client goes away, since neither condition can clear after that.
+	 * Must be called with clientLock released. Both conditions clear only when deliveryComplete() returns a permit,
+	 * and deliveryComplete() runs on Paho's single callback thread - so a caller that blocks that thread, or that
+	 * holds a lock that thread needs, waits for something only it can deliver. It returns the moment the window
+	 * opens, and gives up early if the client goes away, since neither condition can clear after that.
 	 */
 	private void awaitPublishableWindow(long timeoutMillis) {
 		long deadline = System.currentTimeMillis() + timeoutMillis;
@@ -1549,7 +1550,31 @@ public class TahuClient implements MqttCallbackExtended {
 			return;
 		}
 
+		/*
+		 * Refused, not queued, while a disconnect is in flight. The teardown clears the client field before closing
+		 * the Paho client, so between those two points isConnected() reports false while the old socket is still
+		 * open - and a poll loop that reconnects on that would bring up a second session with the same client ID.
+		 * The MQTT server then disconnects the older one and publishes its Will, landing a retained offline STATE on
+		 * a session that has already announced itself.
+		 *
+		 * A refusal rather than a wait, deliberately. Callers that reconnect on a poll retry on their next tick,
+		 * which is the ordering the lock used to give; waiting here would put this thread back into the cycle the
+		 * teardown was restructured to break.
+		 */
+		if (disconnectInProgress) {
+			logger.debug("{}: Not connecting - a disconnect is in progress", getClientId());
+			return;
+		}
+
 		logger.debug("{}: Starting new connect, autoReconnect: {}", getClientId(), autoReconnect);
+
+		/*
+		 * The previous session is detached under clientLock and closed after it is released, rather than by calling
+		 * disconnect() from inside the lock. Monitors are reentrant, so a nested disconnect() would exit its own
+		 * synchronized block with the lock still held by this frame - and closeDetachedSession() must not run that
+		 * way. See the comment on that method.
+		 */
+		DetachedSession detached = null;
 		synchronized (clientLock) {
 			logger.debug("{}: Got lock for new connect", getClientId());
 			try {
@@ -1562,16 +1587,34 @@ public class TahuClient implements MqttCallbackExtended {
 				if (getAutoReconnect() && state.inProgress()) {
 					logger.debug("{}: Connect attempt already in progress", getClientId());
 					return;
-				} else {
-					disconnect(0, 0, false, true);
-					state.setInProgress(true);
-					logger.debug("{}: Starting ConnectThread", getClientId());
-					connectRunnable = new ConnectRunnable(this);
-					connectRunnableThread = new Thread(connectRunnable);
-					connectRunnableThread.start();
 				}
+
+				disconnectInProgress = true;
+				detached = detachSession(false, true, true);
 			} catch (Throwable t) {
-				logger.error("{}: Error connectiong", getClientId(), t);
+				logger.error("{}: Error connecting", getClientId(), t);
+				disconnectInProgress = false;
+				return;
+			}
+		}
+
+		try {
+			closeDetachedSession(detached, 0, 0);
+		} catch (Exception e) {
+			logger.error("{}: Failed to close the previous session - continuing with the connect", getClientId(), e);
+		} finally {
+			disconnectInProgress = false;
+		}
+
+		synchronized (clientLock) {
+			try {
+				state.setInProgress(true);
+				logger.debug("{}: Starting ConnectThread", getClientId());
+				connectRunnable = new ConnectRunnable(this);
+				connectRunnableThread = new Thread(connectRunnable);
+				connectRunnableThread.start();
+			} catch (Throwable t) {
+				logger.error("{}: Error connecting", getClientId(), t);
 			}
 		}
 	}
@@ -1597,127 +1640,213 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	public void disconnect(long disconnectQuieseTime, long disconnectTimeout, boolean sendDisconnect,
 			boolean publishLwt, boolean waitForLwt) throws TahuException {
-		synchronized (clientLock) {
-			disconnectInProgress = true;
+		disconnectSession(null, disconnectQuieseTime, disconnectTimeout, sendDisconnect, publishLwt, waitForLwt);
+	}
 
-			try {
-				shutdownConnectionMonitorThread();
-			} catch (Exception e) {
-				logger.error("{}: Failed to shutdown connection monitor thread", getClientId());
-			}
-
-			try {
-				if (connectRunnable != null && connectRunnableThread != null) {
-					connectRunnable.stopConnectAttempts();
-					connectRunnableThread.interrupt();
+	/**
+	 * Disconnects, optionally only if the live session is still the one the caller means to tear down.
+	 *
+	 * Split in two deliberately. Everything that names the session happens under {@link #clientLock}; the Paho close
+	 * happens after it is released, because that call can wait without limit for a thread that needs the lock - see
+	 * {@link #closeDetachedSession(DetachedSession, long, long)}.
+	 *
+	 * @param expected the session to tear down, or null to tear down whatever is live
+	 * @return true if a session was detached, false if a different one is live
+	 */
+	private boolean disconnectSession(TahuMqttAsyncClient expected, long disconnectQuieseTime, long disconnectTimeout,
+			boolean sendDisconnect, boolean publishLwt, boolean waitForLwt) throws TahuException {
+		DetachedSession detached;
+		try {
+			synchronized (clientLock) {
+				if (expected != null && client != expected) {
+					logger.debug("{}: Not disconnecting - the session to tear down is no longer the live one",
+							getClientId());
+					return false;
 				}
-			} catch (Exception e) {
-				logger.error("{}: Failed to shut down the connect runnable", getClientId());
+
+				disconnectInProgress = true;
+				detached = detachSession(sendDisconnect, publishLwt, waitForLwt);
+
+				// reset the timers if needed
+				if (getDisconnectTime() == null) {
+					this.clearConnectTime();
+					this.renewDisconnectTime();
+					this.renewOfflineDate();
+				}
 			}
 
-			if (client != null) {
-				boolean sendDisconnectPacket = sendDisconnect;
+			closeDetachedSession(detached, disconnectQuieseTime, disconnectTimeout);
+		} finally {
+			disconnectInProgress = false;
+		}
+
+		return detached != null;
+	}
+
+	/**
+	 * Detaches the live session: stops the connection monitor, the connect runnable and the buffer drain, publishes
+	 * the LWT if asked, and clears every field that names the session.
+	 *
+	 * The caller must hold {@link #clientLock}. Nothing here waits on another thread, and nothing here throws - the
+	 * session is detached on every path, so a caller can rely on it being gone once this returns.
+	 *
+	 * @return the detached session for {@link #closeDetachedSession}, or null if there was no client
+	 */
+	private DetachedSession detachSession(boolean sendDisconnect, boolean publishLwt, boolean waitForLwt) {
+		try {
+			shutdownConnectionMonitorThread();
+		} catch (Exception e) {
+			logger.error("{}: Failed to shutdown connection monitor thread", getClientId());
+		}
+
+		try {
+			if (connectRunnable != null && connectRunnableThread != null) {
+				connectRunnable.stopConnectAttempts();
+				connectRunnableThread.interrupt();
+			}
+		} catch (Exception e) {
+			logger.error("{}: Failed to shut down the connect runnable", getClientId());
+		}
+
+		if (client == null) {
+			logger.debug("{}: Disconnect: Client is already null", getClientId());
+
+			/*
+			 * The drain thread is started by connect() before the Paho client is built, so a disconnect with no
+			 * client still has one to stop. Without this it would be left running with no owner, holding its
+			 * TahuClient and everything queued in its buffer from garbage collection - the same orphan that any
+			 * teardown bypassing disconnect() leaves behind.
+			 */
+			shutdownPublishBufferDrainThreadQuietly();
+			return null;
+		}
+
+		boolean sendDisconnectPacket = sendDisconnect;
+		try {
+			/*
+			 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
+			 * configured QoS and be acknowledged. The drain thread is still running at this point; it is stopped
+			 * below, after the LWT.
+			 *
+			 * Guarded on isConnected() and nothing else. With the socket already down the wait cannot succeed - the
+			 * drain declines to publish while the client is disconnected, so the poll ran to the deadline and
+			 * publishLwt() then skipped the LWT anyway, measured at 2011ms of dead time on the path connect() takes
+			 * before every reconnect attempt.
+			 *
+			 * Deliberately NOT also scoped to publishLwt. shutdownPublishBufferDrainThreadQuietly() below runs on
+			 * every disconnect and discards the buffer unconditionally, so a still-connected client disconnecting
+			 * with publishLwt=false would lose an accepted backlog with no chance to flush it - and publish()
+			 * returning null told those callers the messages were queued, not lost. The LWT is the reason the wait
+			 * happens first, not the reason it happens.
+			 *
+			 * This still runs under clientLock, and it waits for a permit that only deliveryComplete() returns. That
+			 * is safe for exactly one reason: deliveryComplete() is the one Paho callback that never needs
+			 * clientLock. Adding a clientLock path to it would turn this wait into a hang.
+			 */
+			if (client.isConnected()) {
+				awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
+			}
+
+			if (publishLwt) {
+				/*
+				 * A failed LWT publish must not abort the disconnect - the session has to come down either way.
+				 */
 				try {
-					/*
-					 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
-					 * configured QoS and be acknowledged. The drain thread is still running at this point; it is
-					 * stopped below, after the LWT.
-					 *
-					 * Guarded on isConnected() and nothing else. With the socket already down the wait cannot
-					 * succeed - the drain declines to publish while the client is disconnected, so the poll ran to
-					 * the deadline and publishLwt() then skipped the LWT anyway, measured at 2011ms of dead time
-					 * holding clientLock on the path connect() takes before every reconnect attempt.
-					 *
-					 * Deliberately NOT also scoped to publishLwt. shutdownPublishBufferDrainThreadQuietly() below
-					 * runs on every disconnect and discards the buffer unconditionally, so a still-connected client
-					 * disconnecting with publishLwt=false would lose an accepted backlog with no chance to flush it -
-					 * and publish() returning null told those callers the messages were queued, not lost. The LWT is
-					 * the reason the wait happens first, not the reason it happens.
-					 */
-					if (client.isConnected()) {
-						awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
-					}
-
-					if (publishLwt) {
-						/*
-						 * A failed LWT publish must not abort the disconnect. Only MqttException is handled below, so
-						 * letting a TahuException out here would skip disconnectForcibly() and close() while the
-						 * finally block still nulls the client, leaking the Paho client with no way to reach it again.
-						 */
-						try {
-							this.publishLwt(waitForLwt);
-						} catch (Exception e) {
-							logger.error("{}: Failed to publish the LWT during disconnect - continuing",
-									getClientId(), e);
-						}
-
-						/*
-						 * Last resort. No acknowledged death certificate was published: either every attempt failed,
-						 * or it went out downgraded to QoS 0 and carries no guarantee. A clean DISCONNECT would tell
-						 * the MQTT server we left gracefully and suppress the Will, leaving subscribers with nothing
-						 * better than that unacknowledged publish - so drop the connection instead and let the server
-						 * publish the Will it already holds from connect(). That Will is QoS 1 and retained, so it is
-						 * strictly the stronger of the two, and an identical retained payload arriving twice is
-						 * harmless.
-						 */
-						if (sendDisconnectPacket && !lwtPublishSucceeded) {
-							logger.warn("{}: Could not publish the LWT on {} by any route - closing without a "
-									+ "DISCONNECT so the MQTT server publishes the Will instead", getClientId(),
-									lwtTopic);
-							sendDisconnectPacket = false;
-						}
-					}
-
-					/*
-					 * Deliberately AFTER the LWT and BEFORE disconnectForcibly(). The drain thread has to be alive
-					 * for a buffered LWT to reach the MQTT server at all, and dead before the client is closed, or
-					 * it publishes into a client that is going away. It also clears the buffer, so anything still
-					 * queued at this point is discarded and counted by getPublishBufferDiscardedMessageCount().
-					 */
-					shutdownPublishBufferDrainThreadQuietly();
-
-					// FIXME - remove This sleep is necessary due to:
-					// https://github.com/eclipse/paho.mqtt.java/issues/850
-					try {
-						Thread.sleep(1000L);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
-					logger.debug("{}: Disconnecting...", getClientId());
-					client.disconnectForcibly(disconnectQuieseTime, disconnectTimeout, sendDisconnectPacket);
-					logger.debug("{}: Done disconecting", getClientId());
-					client.close();
-					logger.debug("{}: Client closed", getClientId());
-				} catch (MqttException e) {
-					throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
-				} finally {
-					client = null;
-					state.setInProgress(false);
-					disconnectInProgress = false;
-					lwtDeliveryToken = null;
-					// Reset re-subscribed flag
-					resubscribed = false;
+					this.publishLwtNow(waitForLwt);
+				} catch (Exception e) {
+					logger.error("{}: Failed to publish the LWT during disconnect - continuing", getClientId(), e);
 				}
-			} else {
-				logger.debug("{}: Disconnect: Client is already null", getClientId());
 
 				/*
-				 * The drain thread is started by connect() before the Paho client is built, so a disconnect with
-				 * no client still has one to stop. Without this it would be left running with no owner, holding
-				 * its TahuClient and everything queued in its buffer from garbage collection - the same orphan
-				 * that any teardown bypassing disconnect() leaves behind.
+				 * Last resort. No acknowledged death certificate was published: either every attempt failed, or it
+				 * went out downgraded to QoS 0 and carries no guarantee. A clean DISCONNECT would tell the MQTT
+				 * server we left gracefully and suppress the Will, leaving subscribers with nothing better than that
+				 * unacknowledged publish - so drop the connection instead and let the server publish the Will it
+				 * already holds from connect(). That Will is QoS 1 and retained, so it is strictly the stronger of
+				 * the two, and an identical retained payload arriving twice is harmless.
 				 */
-				shutdownPublishBufferDrainThreadQuietly();
+				if (sendDisconnectPacket && !lwtPublishSucceeded) {
+					logger.warn("{}: Could not publish the LWT on {} by any route - closing without a "
+							+ "DISCONNECT so the MQTT server publishes the Will instead", getClientId(), lwtTopic);
+					sendDisconnectPacket = false;
+				}
 			}
 
-			// reset the timers if needed
-			if (getDisconnectTime() == null) {
-				this.clearConnectTime();
-				this.renewDisconnectTime();
-				this.renewOfflineDate();
-			}
+			/*
+			 * Deliberately AFTER the LWT and BEFORE the client is closed. The drain thread has to be alive for a
+			 * buffered LWT to reach the MQTT server at all, and dead before the client is closed, or it publishes
+			 * into a client that is going away. It also clears the buffer, so anything still queued at this point is
+			 * discarded and counted by getPublishBufferDiscardedMessageCount().
+			 */
+			shutdownPublishBufferDrainThreadQuietly();
+		} finally {
+			/*
+			 * In a finally so the session is detached even if the LWT path fails unexpectedly. A caller that has
+			 * been told the session is gone must not find it still installed.
+			 */
+			state.setInProgress(false);
+			lwtDeliveryToken = null;
+			// Reset re-subscribed flag
+			resubscribed = false;
+		}
 
-			disconnectInProgress = false;
+		DetachedSession detached = new DetachedSession(client, sendDisconnectPacket);
+		client = null;
+		return detached;
+	}
+
+	/**
+	 * Closes a session detached by {@link #detachSession}. <b>Must be called with {@link #clientLock} released.</b>
+	 *
+	 * Paho's CommsCallback.stop() takes a shortcut only for its own callback thread; every other caller spin waits,
+	 * with no cap, until that thread leaves its run loop. Three of the four callbacks dispatched on that thread need
+	 * clientLock - connectComplete directly, messageArrived and connectionLost through the application callback - so
+	 * holding the lock across this call is a two party deadlock with no timeout on either side.
+	 */
+	private void closeDetachedSession(DetachedSession detached, long disconnectQuieseTime, long disconnectTimeout)
+			throws TahuException {
+		if (detached == null) {
+			return;
+		}
+
+		if (Thread.holdsLock(clientLock)) {
+			/*
+			 * A tripwire rather than a recovery. There is nothing useful to do here, but the deadlock this guards
+			 * against is silent and permanent, so a caller that gets the locking wrong should say so in the log
+			 * rather than hang without explanation.
+			 */
+			logger.error("{}: Closing a detached session while holding clientLock - this can deadlock against Paho's "
+					+ "callback thread", getClientId());
+		}
+
+		// FIXME - remove This sleep is necessary due to:
+		// https://github.com/eclipse/paho.mqtt.java/issues/850
+		try {
+			Thread.sleep(1000L);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+
+		try {
+			logger.debug("{}: Disconnecting...", getClientId());
+			detached.client.disconnectForcibly(disconnectQuieseTime, disconnectTimeout, detached.sendDisconnectPacket);
+			logger.debug("{}: Done disconecting", getClientId());
+			detached.client.close();
+			logger.debug("{}: Client closed", getClientId());
+		} catch (MqttException e) {
+			throw new TahuException(TahuErrorCode.INTERNAL_ERROR, e);
+		}
+	}
+
+	/** A session that has been detached under clientLock and still needs its Paho client closed outside it. */
+	private static final class DetachedSession {
+
+		private final TahuMqttAsyncClient client;
+		private final boolean sendDisconnectPacket;
+
+		private DetachedSession(TahuMqttAsyncClient client, boolean sendDisconnectPacket) {
+			this.client = client;
+			this.sendDisconnectPacket = sendDisconnectPacket;
 		}
 	}
 
@@ -2374,6 +2503,16 @@ public class TahuClient implements MqttCallbackExtended {
 	 * which is the behaviour this method was written against, and why it recovers only from an exception.
 	 */
 	public void publishBirthMessage() {
+		/*
+		 * Checked before clientLock, not inside it. A session being torn down has no use for a BIRTH, and the
+		 * teardown holds this lock across a bounded buffer drain - so a callback thread arriving here would park on
+		 * it for that long, stalling every other callback for this client, only to find a session that is gone.
+		 */
+		if (disconnectInProgress) {
+			logger.debug("{}: Not publishing the BIRTH - a disconnect is in progress", getClientId());
+			return;
+		}
+
 		synchronized (clientLock) {
 			/*
 			 * client is null checked as well as birthTopic. The escalation below tears the session down through
@@ -2454,13 +2593,17 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private void startBirthRecovery(boolean awaitWindow) {
 		synchronized (clientLock) {
-			if (birthRecoveryThread != null && birthRecoveryThread.isAlive()) {
-				// One recovery per session. A second would race the first through disconnect().
-				logger.debug("{}: BIRTH recovery already running", getClientId());
+			/*
+			 * One recovery per session, not one per live thread. A worker started for an earlier session can still
+			 * be alive here; suppressing on that would drop a new session's genuine BIRTH failure.
+			 */
+			if (birthRecoveryThread != null && birthRecoveryThread.isAlive() && birthRecoverySession == client) {
+				logger.debug("{}: BIRTH recovery already running for this session", getClientId());
 				return;
 			}
 
-			birthRecoveryThread = new Thread(new BirthRecovery(awaitWindow),
+			birthRecoverySession = client;
+			birthRecoveryThread = new Thread(new BirthRecovery(awaitWindow, client),
 					"TahuBirthRecovery-" + getClientId().getMqttClientId());
 			birthRecoveryThread.setDaemon(true);
 			birthRecoveryThread.start();
@@ -2471,8 +2614,17 @@ public class TahuClient implements MqttCallbackExtended {
 
 		private final boolean awaitWindow;
 
-		BirthRecovery(boolean awaitWindow) {
+		/*
+		 * The session this worker was started for. Everything below acts on it by identity rather than on whatever
+		 * happens to be installed when the worker wakes: the wait is bounded but the lock that follows it is not, and
+		 * a session can be lost and replaced in that gap. Acting on the wrong one would publish a second retained
+		 * BIRTH onto a session that already announced itself, or tear down a healthy one.
+		 */
+		private final TahuMqttAsyncClient session;
+
+		BirthRecovery(boolean awaitWindow, TahuMqttAsyncClient session) {
 			this.awaitWindow = awaitWindow;
+			this.session = session;
 		}
 
 		@Override
@@ -2482,10 +2634,15 @@ public class TahuClient implements MqttCallbackExtended {
 				awaitPublishableWindow(BIRTH_BACKPRESSURE_WAIT);
 			}
 
-			boolean tornDown = false;
 			synchronized (clientLock) {
-				if (birthTopic == null || client == null || !client.isConnected()) {
-					// The session went away while we waited - there is no BIRTH to publish and nothing to tear down.
+				if (client != session) {
+					// The failure this worker was started for belongs to a session that is no longer live.
+					logger.debug("{}: Abandoning BIRTH recovery - the session it was started for is gone",
+							getClientId());
+					return;
+				}
+
+				if (birthTopic == null || !client.isConnected()) {
 					return;
 				}
 
@@ -2498,32 +2655,34 @@ public class TahuClient implements MqttCallbackExtended {
 					}
 				}
 
-				/*
-				 * No BIRTH reached the MQTT server, so the session must not be left announcing itself online.
-				 *
-				 * Through disconnect() rather than a bare disconnectForcibly(), so the session is torn down by the
-				 * one path that does it completely - the drain stopped and its buffer discarded and counted, the
-				 * Paho client closed rather than leaked, the client field cleared.
-				 *
-				 * sendDisconnect false so the MQTT server publishes the Will rather than treating this as a graceful
-				 * exit, and publishLwt false because there is no acknowledged death to send from a session that never
-				 * announced itself - the Will is the better carrier.
-				 */
 				logger.error("{}: Could not publish the BIRTH on {} - tearing the session down", getClientId(),
 						birthTopic);
-				try {
-					disconnect(0, 1, false, false, false);
-					tornDown = true;
-				} catch (Exception e) {
-					logger.error("{}: Failed to disconnect after failed BIRTH publish", getClientId(), e);
-				}
 			}
 
 			/*
-			 * Re-arm recovery, outside clientLock so the callback's connect() is not entered holding it.
+			 * Outside clientLock, and scoped to this session. disconnectSession() re-checks the identity under the
+			 * lock, so losing the race here costs nothing.
 			 *
-			 * disconnect() is what makes this necessary: it stops the connection monitor, stops the connect runnable
-			 * and clears the client field, and a locally requested disconnect produces no connectionLost from Paho -
+			 * sendDisconnect false so the MQTT server publishes the Will rather than treating this as a graceful
+			 * exit, and publishLwt false because there is no acknowledged death to send from a session that never
+			 * announced itself - the Will is the better carrier.
+			 */
+			boolean tornDown;
+			try {
+				tornDown = disconnectSession(session, 0, 1, false, false, false);
+			} catch (Exception e) {
+				/*
+				 * The close failed, but detachSession() had already cleared the session before anything that can
+				 * throw ran - so the client is gone and recovery still has to be re-armed. Treating a throw as "not
+				 * torn down" is what left a host permanently offline whenever close() raced the socket teardown.
+				 */
+				logger.error("{}: Failed to close the session after a failed BIRTH publish", getClientId(), e);
+				tornDown = true;
+			}
+
+			/*
+			 * Re-arm recovery. disconnect() stops the connection monitor, stops the connect runnable and clears the
+			 * client field, and a locally requested disconnect produces no connectionLost from Paho -
 			 * ClientComms.shutdownConnection passes a null cause, and CommsCallback only forwards a non-null one. A
 			 * host application whose only reconnect is the connectionLost callback would otherwise stay offline for
 			 * good, with a retained offline STATE on its topic. Clients that poll isConnected() in their own run
@@ -2594,6 +2753,24 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	public void publishLwt(boolean waitForLwt) throws MqttException, TahuException {
+		/*
+		 * Same reasoning as publishBirthMessage(), with one difference that matters: the disconnect path publishes
+		 * the death certificate through publishLwtNow() rather than through here. Guarding that call too would skip
+		 * the LWT on every disconnect, which is the one moment it exists for.
+		 */
+		if (disconnectInProgress) {
+			logger.debug("{}: Not publishing the LWT - a disconnect is in progress and will publish it", getClientId());
+			return;
+		}
+
+		publishLwtNow(waitForLwt);
+	}
+
+	/**
+	 * Publishes the LWT unconditionally, for the disconnect path that is itself the reason a disconnect is in
+	 * progress. Every other caller goes through {@link #publishLwt(boolean)}.
+	 */
+	private void publishLwtNow(boolean waitForLwt) throws MqttException, TahuException {
 		synchronized (clientLock) {
 			boolean clientConnected = client != null && client.isConnected();
 			boolean lwtDeliveryComplete = false;

@@ -59,6 +59,9 @@ import org.testng.annotations.Test;
 public class TahuClientPublishBufferTest {
 
 	private static final long TIMEOUT_MS = 5000;
+
+	/* The BIRTH backpressure budget (500ms) plus the Paho workaround sleep (1000ms), with room to settle. */
+	private static final long BIRTH_WAIT_PLUS_SLACK = 2200;
 	private static final long DRAIN_POLL_MS = 250;
 
 	private TahuClient tahuClient;
@@ -908,6 +911,268 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * The Paho close must not run while clientLock is held.
+	 *
+	 * CommsCallback.stop() takes a shortcut only for its own callback thread; every other caller spin waits, with no
+	 * cap, for that thread to leave its run loop. Three of the four callbacks it dispatches need clientLock, so a
+	 * teardown that holds the lock across the close waits for a thread that is waiting for the lock. Neither side has
+	 * a timeout, and clientLock is never released again.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theTeardownDoesNotHoldClientLockAcrossThePahoClose() throws Exception {
+		wire(8, 8);
+		final Object clientLock = get(tahuClient, "clientLock");
+		final CountDownLatch lockTaken = new CountDownLatch(1);
+
+		/*
+		 * Recorded inside the close, not after it. Asserting on the latch afterwards proves nothing: the contender
+		 * gets the lock the moment disconnect() returns either way, so the check passes against a build that held
+		 * the lock throughout. What has to be true is that the lock was free WHILE the close was running.
+		 */
+		final AtomicBoolean lockFreeDuringClose = new AtomicBoolean(false);
+
+		// Stands in for the callback thread needing clientLock while stop() waits for it
+		fakeClient.duringDisconnectForcibly = () -> {
+			Thread contender = new Thread(() -> {
+				synchronized (clientLock) {
+					lockTaken.countDown();
+				}
+			}, "lock-contender");
+			contender.setDaemon(true);
+			contender.start();
+			try {
+				lockFreeDuringClose.set(lockTaken.await(2, TimeUnit.SECONDS));
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		tahuClient.disconnect(0, 1, false, false, false);
+
+		Assert.assertTrue(lockFreeDuringClose.get(),
+				"clientLock was held across the Paho close - a thread that needs it cannot get in, which is the "
+						+ "deadlock when that thread is the one the close is waiting for");
+	}
+
+	/**
+	 * A connect during a teardown must be refused, not raced.
+	 *
+	 * The teardown clears the client field before closing the Paho client, so for the length of that close -
+	 * at least the unconditional Paho workaround sleep - isConnected() reports false while the old socket is still
+	 * open. A poll loop that reconnects on that brings up a second session with the same client ID, and MQTT 3.1.1
+	 * requires the server to disconnect the older one, publishing its Will: a retained offline STATE arriving after
+	 * the new session's BIRTH.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void connectIsRefusedWhileADisconnectIsInProgress() throws Exception {
+		wire(8, 8);
+		final CountDownLatch inTeardown = new CountDownLatch(1);
+		final CountDownLatch releaseTeardown = new CountDownLatch(1);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			inTeardown.countDown();
+			try {
+				releaseTeardown.await(2, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, false, false);
+			} catch (Exception e) {
+				// The assertions below report it
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+
+		Assert.assertTrue(inTeardown.await(3, TimeUnit.SECONDS), "Precondition: the teardown must be in flight");
+
+		try {
+			tahuClient.connect();
+
+			Assert.assertNull(get(tahuClient, "connectRunnableThread"),
+					"A connect while the old session is still closing must be refused - two sessions with one client "
+							+ "id makes the MQTT server drop the older one and publish its Will");
+		} finally {
+			releaseTeardown.countDown();
+		}
+	}
+
+	/**
+	 * A session being torn down has no use for a BIRTH, and the caller should not queue behind the teardown to
+	 * learn it.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aBirthIsNotPublishedWhileADisconnectIsInProgress() throws Exception {
+		wire(8, 8);
+		configureBirth();
+		set(tahuClient, "disconnectInProgress", true);
+
+		tahuClient.publishBirthMessage();
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"A BIRTH must not be published into a session that is being torn down");
+	}
+
+	/**
+	 * Another caller must not publish an LWT into a session that is already being torn down.
+	 *
+	 * The disconnect publishes the death certificate itself, through publishLwtNow(). This guard is on the public
+	 * entry only, for callers arriving from elsewhere - TahuHostCallback corrects a mismatched STATE this way. It
+	 * must not catch the teardown's own publish, which is what the LWT tests around disconnect() pin.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void anLwtFromAnotherCallerIsNotPublishedWhileADisconnectIsInProgress() throws Exception {
+		wire(8, 8);
+		configureLwt(1);
+		set(tahuClient, "disconnectInProgress", true);
+
+		tahuClient.publishLwt(true);
+
+		Assert.assertEquals(fakeClient.publishedTopics(), List.of(),
+				"A second death certificate must not go out while the disconnect is publishing its own");
+	}
+
+	/**
+	 * A worker started for one session must not act on a later one.
+	 *
+	 * The wait is bounded but the clientLock that follows it is not, and a session can be lost and replaced in that
+	 * gap - connectionLost reconnects synchronously. Re-validating only "some client is up" let a stale worker
+	 * publish a second retained BIRTH onto a session that had already announced itself, or tear down a healthy one.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aStaleRecoveryWorkerDoesNotActOnANewSession() throws Exception {
+		wire(0, 8);
+		configureBirth();
+
+		// Starts a worker that will wait for the window, bound to this session
+		tahuClient.publishBirthMessage();
+
+		// The session it was started for goes away and a healthy one replaces it, mid wait
+		FakeMqttClient newSession = new FakeMqttClient();
+		set(tahuClient, "client", newSession);
+		set(tahuClient, "semaphore", new Semaphore(8, true));
+
+		Thread.sleep(BIRTH_WAIT_PLUS_SLACK);
+
+		Assert.assertEquals(newSession.publishedTopics(), List.of(),
+				"A stale worker must not publish a second BIRTH onto a session that already announced itself");
+		Assert.assertFalse(newSession.disconnectForciblyCalled,
+				"A stale worker must not tear down a healthy session it was never started for");
+		Assert.assertEquals(callback.connectionLostCount.get(), 0,
+				"No teardown happened, so recovery must not be re-armed");
+	}
+
+	/**
+	 * A worker left over from a dead session must not suppress a new session's recovery.
+	 *
+	 * The other half of binding recovery to a session. Tracking only "is a worker alive" makes the guard one
+	 * recovery per thread rather than per session, so a stale worker still waiting on behalf of a session that has
+	 * gone swallows the next session's genuine BIRTH failure with a debug line - and that session is then left
+	 * announcing itself with no BIRTH on the wire, which is the defect all of this exists to prevent.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aStaleWorkerDoesNotSuppressANewSessionsRecovery() throws Exception {
+		wire(0, 8);
+		configureBirth();
+
+		// Worker for the first session, which will sit in its wait
+		tahuClient.publishBirthMessage();
+
+		// That session is replaced while the worker is still alive, and the new one is also under backpressure
+		FakeMqttClient newSession = new FakeMqttClient();
+		set(tahuClient, "client", newSession);
+		set(tahuClient, "semaphore", new Semaphore(0, true));
+
+		tahuClient.publishBirthMessage();
+
+		awaitTrue(() -> newSession.disconnectForciblyCalled,
+				"The new session's BIRTH failure must start its own recovery, not be dropped because a worker for a "
+						+ "session that no longer exists happens to still be alive");
+	}
+
+	/**
+	 * A reconnect must close the previous session with clientLock released.
+	 *
+	 * connect() tears the old session down before building a new one, and it used to do that from inside its own
+	 * synchronized block. Monitors are reentrant, so a nested disconnect() exits its own block with the lock still
+	 * held by the outer frame - which puts the Paho close back under the lock on the path taken before every
+	 * reconnect, the most travelled path there is.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aReconnectClosesThePreviousSessionOutsideClientLock() throws Exception {
+		wire(8, 8);
+		final Object clientLock = get(tahuClient, "clientLock");
+		final CountDownLatch lockTaken = new CountDownLatch(1);
+		final AtomicBoolean lockFreeDuringClose = new AtomicBoolean(false);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			Thread contender = new Thread(() -> {
+				synchronized (clientLock) {
+					lockTaken.countDown();
+				}
+			}, "lock-contender");
+			contender.setDaemon(true);
+			contender.start();
+			try {
+				lockFreeDuringClose.set(lockTaken.await(2, TimeUnit.SECONDS));
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		try {
+			tahuClient.connect();
+
+			Assert.assertTrue(lockFreeDuringClose.get(),
+					"connect() held clientLock across the close of the previous session - the callback thread the "
+							+ "close waits for needs that lock");
+		} finally {
+			// The connect attempt this starts is not a daemon, and there is no MQTT server for it to reach
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
+	 * The re-arm must fire even when the close throws.
+	 *
+	 * The session is detached - monitor stopped, connect runnable stopped, client field cleared - before anything
+	 * that can throw runs, so a close that fails still leaves the session destroyed. Treating the throw as "not torn
+	 * down" skipped the notification and left the host permanently offline, which is the failure the re-arm exists to
+	 * prevent. close() throwing is reachable: it is the Paho race the unconditional sleep works around.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theReArmFiresEvenWhenTheCloseThrows() throws Exception {
+		wire(0, 8);
+		configureBirth();
+		fakeClient.closeThrows = true;
+
+		tahuClient.publishBirthMessage();
+
+		awaitTrue(() -> callback.connectionLostCount.get() == 1,
+				"A close that throws still destroyed the session, so recovery must still be re-armed");
+		Assert.assertNull(get(tahuClient, "client"), "The session must be gone whether or not the close threw");
+	}
+
+	/**
 	 * A second BIRTH after a teardown must not throw.
 	 *
 	 * The guard was birthTopic != null && client.isConnected(), with no null check on the client. The previous
@@ -1072,7 +1337,23 @@ public class TahuClientPublishBufferTest {
 			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
 		}
 		awaitBufferDepth(3);
-		releasePermits(3);
+
+		/*
+		 * Released only after disconnect() has started, so the flush can only happen inside the wait. Releasing them
+		 * first lets the drain publish everything before disconnect() is even entered, and the assertions below are
+		 * then satisfied without the wait running at all - measured at 3 vacuous passes in 12 runs against a build
+		 * with the wait scoped back under publishLwt.
+		 */
+		Thread releaser = new Thread(() -> {
+			try {
+				Thread.sleep(200);
+				releasePermits(3);
+			} catch (Exception e) {
+				// The assertions below report it
+			}
+		}, "late-permit-flush");
+		releaser.setDaemon(true);
+		releaser.start();
 
 		tahuClient.disconnect(0, 1, false, false, false);
 
@@ -1492,6 +1773,8 @@ public class TahuClientPublishBufferTest {
 		private volatile ExecutorService ackExecutor;
 		private volatile boolean disconnectSent;
 		private volatile boolean disconnectForciblyCalled;
+		private volatile Runnable duringDisconnectForcibly;
+		private volatile boolean closeThrows;
 
 		private FakeMqttClient() throws MqttException {
 			super("tcp://localhost:1883", "test-client", null);
@@ -1559,11 +1842,23 @@ public class TahuClientPublishBufferTest {
 			this.disconnectSent = sendDisconnectPacket;
 			this.disconnectForciblyCalled = true;
 			connected.set(false);
+
+			/*
+			 * Stands in for CommsCallback.stop(), which spin waits for Paho's callback thread whenever it is called
+			 * from any other thread. Set by the test that checks clientLock is free while this runs.
+			 */
+			Runnable hook = duringDisconnectForcibly;
+			if (hook != null) {
+				hook.run();
+			}
 		}
 
 		@Override
-		public void close() {
-			// no-op - nothing to release
+		public void close() throws MqttException {
+			if (closeThrows) {
+				// What Paho raises when the forced shutdown has not finished - paho.mqtt.java#850
+				throw new MqttException(MqttException.REASON_CODE_CLIENT_CONNECTED);
+			}
 		}
 
 		@Override
