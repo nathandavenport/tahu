@@ -60,6 +60,9 @@ public class TahuClientPublishBufferTest {
 
 	private static final long TIMEOUT_MS = 5000;
 
+	/* The pre-LWT drain budget, plus the Paho workaround sleep the disconnect pays regardless. */
+	private static final long LWT_DRAIN_BUDGET_MS = 2000;
+
 	/* The BIRTH backpressure budget (500ms) plus the Paho workaround sleep (1000ms), with room to settle. */
 	private static final long BIRTH_WAIT_PLUS_SLACK = 2200;
 	private static final long DRAIN_POLL_MS = 250;
@@ -953,6 +956,37 @@ public class TahuClientPublishBufferTest {
 		Assert.assertTrue(lockFreeDuringClose.get(),
 				"clientLock was held across the Paho close - a thread that needs it cannot get in, which is the "
 						+ "deadlock when that thread is the one the close is waiting for");
+	}
+
+	/**
+	 * The pre-LWT flush must not wait on the thread that would have to satisfy it.
+	 *
+	 * A buffer is only non-empty because the in-flight window was exhausted, and the only permit release that lets
+	 * the drain publish is deliveryComplete() - which Paho dispatches on its single callback thread. A disconnect
+	 * taken on that thread therefore blocks its own releaser: it runs the full budget, drains nothing, and the
+	 * buffer is discarded anyway. EdgeClient reaches exactly this, inline from messageArrived, on any offline STATE
+	 * for the configured primary host.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theDrainWaitDoesNotRunOnPahosCallbackThread() throws Exception {
+		wire(0, 8);
+		for (int i = 0; i < 3; i++) {
+			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
+		}
+		awaitBufferDepth(3);
+
+		// This test thread stands in for the callback thread, which is how EdgeClient reaches disconnect()
+		set(tahuClient, "pahoCallbackThread", Thread.currentThread());
+
+		long start = System.currentTimeMillis();
+		tahuClient.disconnect(0, 1, false, false, false);
+		long elapsed = System.currentTimeMillis() - start;
+
+		Assert.assertTrue(elapsed < LWT_DRAIN_BUDGET_MS, "The flush waited " + elapsed + "ms on the one thread that "
+				+ "could have returned a permit - it can only ever reach its deadline and discard the buffer anyway");
+		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 3,
+				"Nothing could be flushed, so the loss must still be counted rather than quietly waited over");
 	}
 
 	/**

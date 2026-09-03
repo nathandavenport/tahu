@@ -267,6 +267,14 @@ public class TahuClient implements MqttCallbackExtended {
 	 * and two of the three routes into publishBirthMessage() arrive on it - so a wait taken there blocks the only
 	 * thread that could satisfy it, and a teardown taken there re-enters connect() from inside connectComplete().
 	 */
+	/*
+	 * Paho dispatches every callback for a client from one thread. Recorded by identity, not by name: the
+	 * "MQTT Call: <clientId>" name is an implementation detail, and a guard that silently stops matching on an
+	 * upgrade is worse than no guard. Null until the first callback arrives, which is the safe default - it reads as
+	 * "some other thread", and every wait keeps its full budget.
+	 */
+	private volatile Thread pahoCallbackThread;
+
 	private Thread birthRecoveryThread;
 	private TahuMqttAsyncClient birthRecoverySession;
 
@@ -1120,6 +1128,25 @@ public class TahuClient implements MqttCallbackExtended {
 						getClientId());
 				return;
 			}
+
+			/*
+			 * A buffer is only ever non-empty because the in-flight window was exhausted, and the only permit release
+			 * that lets the drain publish is deliveryComplete() - which Paho dispatches on this very thread. Waiting
+			 * here would block the thread that has to satisfy the wait, so it runs to its deadline, drains nothing,
+			 * and the buffer is discarded anyway. Whatever was publishable with the permits already free has been
+			 * published by the check above; there is nothing left to wait for.
+			 *
+			 * The other two release sites are failure paths - a message that never reached the client - so a permit
+			 * arriving from one of those would not flush anything either.
+			 *
+			 * Every other caller keeps the full budget: for them the acknowledgement really can arrive while they
+			 * wait, and that window is what stops an accepted backlog being discarded unsent.
+			 */
+			if (Thread.currentThread() == pahoCallbackThread && getAvailablePublishPermits() == 0) {
+				logger.debug("{}: Stopped waiting for the publish buffer - on the callback thread with no permits "
+						+ "free, so no acknowledgement can arrive while this waits", getClientId());
+				return;
+			}
 			try {
 				Thread.sleep(PUBLISH_BUFFER_POLL_INTERVAL);
 			} catch (InterruptedException e) {
@@ -1482,6 +1509,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void connectionLost(Throwable cause) {
+		pahoCallbackThread = Thread.currentThread();
 		logger.debug("{}: MQTT connectionLost() to {} :: {}", getClientId(), getMqttServerName(), getMqttServerUrl());
 		if (logger.isTraceEnabled()) {
 			if (client != null) {
@@ -1510,6 +1538,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void deliveryComplete(IMqttDeliveryToken token) {
+		pahoCallbackThread = Thread.currentThread();
 		try {
 			synchronized (lwtDeliveryLock) {
 				if (lwtDeliveryToken != null && lwtDeliveryToken.getMessageId() == token.getMessageId()) {
@@ -1534,6 +1563,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void messageArrived(String topic, MqttMessage mqttMessage) throws Exception {
+		pahoCallbackThread = Thread.currentThread();
 		logger.debug("{}: MQTT message arrived on topic {}", getClientId(), topic);
 		numMesgsArrived++;
 		getCallback().messageArrived(getMqttServerName(), getMqttServerUrl(), getClientId(), topic, mqttMessage);
@@ -2311,6 +2341,7 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void connectComplete(boolean reconnect, String serverURI) {
+		pahoCallbackThread = Thread.currentThread();
 
 		// Check if we are in the process of disconnecting
 		if (disconnectInProgress) {
