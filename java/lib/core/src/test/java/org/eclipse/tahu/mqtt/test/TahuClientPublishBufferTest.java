@@ -959,6 +959,26 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * The callback thread has to be recorded by the callbacks themselves.
+	 *
+	 * The drain wait guard compares against this field, so if nothing ever populates it the guard is inert and the
+	 * futile wait comes back silently. Recorded by identity rather than by matching Paho's "MQTT Call: <clientId>"
+	 * thread name, which is an implementation detail that could change under us without failing anything.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void pahosCallbackThreadIsRecordedFromItsCallbacks() throws Exception {
+		wire(8, 8);
+		Assert.assertNull(get(tahuClient, "pahoCallbackThread"),
+				"Precondition: nothing is recorded until a callback actually arrives");
+
+		tahuClient.messageArrived("spBv1.0/STATE/host-1", new MqttMessage("{}".getBytes()));
+
+		Assert.assertSame(get(tahuClient, "pahoCallbackThread"), Thread.currentThread(),
+				"A Paho callback must record the thread it arrived on, or the drain wait guard can never fire");
+	}
+
+	/**
 	 * The pre-LWT flush must not wait on the thread that would have to satisfy it.
 	 *
 	 * A buffer is only non-empty because the in-flight window was exhausted, and the only permit release that lets
@@ -1103,6 +1123,31 @@ public class TahuClientPublishBufferTest {
 				"A stale worker must not tear down a healthy session it was never started for");
 		Assert.assertEquals(callback.connectionLostCount.get(), 0,
 				"No teardown happened, so recovery must not be re-armed");
+	}
+
+	/**
+	 * A teardown scoped to one session must refuse to touch a different live one.
+	 *
+	 * The recovery worker checks identity under clientLock, then releases it before tearing down - so the session
+	 * can change in between. This re-check is what makes that release safe, and without it the worker's own check
+	 * only narrows the race rather than closing it.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aTeardownScopedToAnOldSessionRefusesToTouchTheLiveOne() throws Exception {
+		wire(8, 8);
+		FakeMqttClient replacedSession = new FakeMqttClient();
+
+		Method disconnectSession = TahuClient.class.getDeclaredMethod("disconnectSession", TahuMqttAsyncClient.class,
+				long.class, long.class, boolean.class, boolean.class, boolean.class);
+		disconnectSession.setAccessible(true);
+		boolean tornDown =
+				(Boolean) disconnectSession.invoke(tahuClient, replacedSession, 0L, 1L, false, false, false);
+
+		Assert.assertFalse(tornDown, "A teardown for a session that is no longer live must report that it did none");
+		Assert.assertFalse(fakeClient.disconnectForciblyCalled,
+				"The live session must be left alone - it is not the one the caller meant to tear down");
+		Assert.assertNotNull(get(tahuClient, "client"), "The live session must still be installed");
 	}
 
 	/**
