@@ -1082,6 +1082,28 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * A disconnect that finds no client must still clear the connect-in-progress flag.
+	 *
+	 * A connect attempt that is still building its Paho client has state.inProgress() true and the field still
+	 * null. detachSession() stops that attempt, so nothing is in progress once it returns - but its early exit for
+	 * a null client skipped the finally that says so. The flag then stayed true with the only thread that would
+	 * have cleared it already stopped, and every later connect() was refused at the autoReconnect gate. Permanent,
+	 * for the life of the client.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aDisconnectWithNoClientStillClearsTheConnectInProgressFlag() throws Exception {
+		// Deliberately no wire() - the client field is null, as it is while a connect attempt is building one
+		setInProgress(tahuClient, true);
+
+		tahuClient.disconnect(0, 1, false, false, false);
+
+		Assert.assertFalse(state(tahuClient),
+				"The disconnect stopped the connect attempt, so it must not leave the flag claiming one is still "
+						+ "running - that refuses every later connect() for the life of the client");
+	}
+
+	/**
 	 * The pre-reconnect client discard must not hold clientLock across the Paho close either.
 	 *
 	 * ConnectRunnable drops any leftover client before building a new one, and it did that inside
@@ -1957,6 +1979,13 @@ public class TahuClientPublishBufferTest {
 			Thread.sleep(10);
 		}
 		Assert.fail("Buffer depth never reached " + expected + " (currently " + tahuClient.getPublishBufferDepth() + ")");
+	}
+
+	private static void setInProgress(TahuClient client, boolean inProgress) throws Exception {
+		Object state = get(client, "state");
+		Method setter = state.getClass().getDeclaredMethod("setInProgress", boolean.class);
+		setter.setAccessible(true);
+		setter.invoke(state, inProgress);
 	}
 
 	private static boolean state(TahuClient client) throws Exception {

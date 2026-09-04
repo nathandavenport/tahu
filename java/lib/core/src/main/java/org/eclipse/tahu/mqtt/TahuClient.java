@@ -1864,21 +1864,21 @@ public class TahuClient implements MqttCallbackExtended {
 			logger.error("{}: Failed to shut down the connect runnable", getClientId());
 		}
 
-		if (client == null) {
-			logger.debug("{}: Disconnect: Client is already null", getClientId());
-
-			/*
-			 * The drain thread is started by connect() before the Paho client is built, so a disconnect with no
-			 * client still has one to stop. Without this it would be left running with no owner, holding its
-			 * TahuClient and everything queued in its buffer from garbage collection - the same orphan that any
-			 * teardown bypassing disconnect() leaves behind.
-			 */
-			shutdownPublishBufferDrainThreadQuietly();
-			return null;
-		}
-
-		boolean sendDisconnectPacket = sendDisconnect;
 		try {
+			if (client == null) {
+				logger.debug("{}: Disconnect: Client is already null", getClientId());
+
+				/*
+				 * The drain thread is started by connect() before the Paho client is built, so a disconnect with no
+				 * client still has one to stop. Without this it would be left running with no owner, holding its
+				 * TahuClient and everything queued in its buffer from garbage collection - the same orphan that any
+				 * teardown bypassing disconnect() leaves behind.
+				 */
+				shutdownPublishBufferDrainThreadQuietly();
+				return null;
+			}
+
+			boolean sendDisconnectPacket = sendDisconnect;
 			/*
 			 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
 			 * configured QoS and be acknowledged. The drain thread is still running at this point; it is stopped
@@ -1936,20 +1936,28 @@ public class TahuClient implements MqttCallbackExtended {
 			 * discarded and counted by getPublishBufferDiscardedMessageCount().
 			 */
 			shutdownPublishBufferDrainThreadQuietly();
+			DetachedSession detached = new DetachedSession(client, sendDisconnectPacket);
+			client = null;
+			return detached;
 		} finally {
 			/*
-			 * In a finally so the session is detached even if the LWT path fails unexpectedly. A caller that has
+			 * On every path out, including the one that found no client to detach.
+			 *
+			 * In a finally so the session is detached even if the LWT path fails unexpectedly - a caller that has
 			 * been told the session is gone must not find it still installed.
+			 *
+			 * And on the no-client path because a connect attempt that is still building its client has
+			 * state.inProgress() true with the field still null. This method has just stopped that attempt, so
+			 * nothing is in progress any more; leaving the flag set asserted otherwise, and the thread that would
+			 * have cleared it was the one being stopped. Every later connect() was then refused at the
+			 * autoReconnect gate for the life of the client. connect() re-arms the flag immediately after this
+			 * returns, under the same lock, so the extra clear cannot open a window there.
 			 */
 			state.setInProgress(false);
 			lwtDeliveryToken = null;
 			// Reset re-subscribed flag
 			resubscribed = false;
 		}
-
-		DetachedSession detached = new DetachedSession(client, sendDisconnectPacket);
-		client = null;
-		return detached;
 	}
 
 	/**
