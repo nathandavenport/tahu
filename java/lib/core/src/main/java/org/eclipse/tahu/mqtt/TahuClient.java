@@ -1752,6 +1752,44 @@ public class TahuClient implements MqttCallbackExtended {
 		return detached != null;
 	}
 
+	/**
+	 * Drops any client left over from a previous attempt, before a new one is built.
+	 *
+	 * Split the same way {@link #detachSession} and {@link #closeDetachedSession} are, and for the same reason: the
+	 * field is cleared under {@link #clientLock} and the Paho close runs with the lock released. This runs on
+	 * connectRunnableThread, so CommsCallback.stop() takes its uncapped spin wait for Paho's callback thread - and
+	 * that thread needs clientLock through three of the four callbacks it dispatches. Holding the lock across the
+	 * close here is the same two party deadlock, on the path taken before every reconnect attempt.
+	 */
+	private void discardClientForReconnect() {
+		TahuMqttAsyncClient closing;
+		boolean wasConnected;
+		synchronized (clientLock) {
+			if (client == null) {
+				return;
+			}
+
+			closing = client;
+			wasConnected = client.isConnected();
+			if (wasConnected) {
+				shutdownConnectionMonitorThread();
+			}
+
+			// Cleared here so nothing can reach the client being closed, exactly as detachSession() does
+			client = null;
+		}
+
+		try {
+			if (wasConnected) {
+				closing.disconnectForcibly(0, 1, false);
+			}
+			// closing.setCallback(null);
+			closing.close();
+		} catch (MqttException e) {
+			logger.error("{}: Error while disconnecting client", getClientId(), e);
+		}
+	}
+
 	/** Releases one teardown claim, and never takes the count below zero if a caller unbalances it. */
 	private void releaseTeardownClaim() {
 		int remaining = teardownsInFlight.decrementAndGet();
@@ -2062,22 +2100,7 @@ public class TahuClient implements MqttCallbackExtended {
 		@Override
 		public void run() {
 			// ensure we are disconnected and null
-			synchronized (clientLock) {
-				if (client != null) {
-					try {
-						if (client.isConnected()) {
-							client.disconnectForcibly(0, 1, false);
-							shutdownConnectionMonitorThread();
-						}
-						// client.setCallback(null);
-						client.close();
-					} catch (MqttException e) {
-						logger.error("{}: Error while disconnecting client", getClientId(), e);
-					} finally {
-						client = null;
-					}
-				}
-			}
+			discardClientForReconnect();
 
 			try {
 				// Reset re-subscribed flag
@@ -2504,6 +2527,13 @@ public class TahuClient implements MqttCallbackExtended {
 										// https://github.com/eclipse/paho.mqtt.java/issues/850
 										Thread.sleep(1000);
 
+										/*
+										 * Under clientLock, unlike the teardowns in discardClientForReconnect()
+										 * and closeDetachedSession(). Not an exception to that rule: Paho
+										 * dispatches action listeners on its callback thread, so
+										 * CommsCallback.stop() takes its same thread shortcut and waits for
+										 * nothing. Moving this off that thread would need the same split.
+										 */
 										synchronized (clientLock) {
 											if (client != null) {
 												// Force the disconnect and return

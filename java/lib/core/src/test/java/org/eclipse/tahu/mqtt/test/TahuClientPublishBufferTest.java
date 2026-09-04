@@ -1082,6 +1082,46 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * The pre-reconnect client discard must not hold clientLock across the Paho close either.
+	 *
+	 * ConnectRunnable drops any leftover client before building a new one, and it did that inside
+	 * synchronized (clientLock) - the same shape closeDetachedSession() exists to avoid. It runs on
+	 * connectRunnableThread, so CommsCallback.stop() takes its uncapped spin wait for the callback thread, and that
+	 * thread needs clientLock through three of the four callbacks it dispatches. Pre-existing rather than a
+	 * regression, but it is the path taken before every reconnect attempt.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void theReconnectDiscardDoesNotHoldClientLockAcrossThePahoClose() throws Exception {
+		wire(8, 8);
+		final Object clientLock = get(tahuClient, "clientLock");
+		final CountDownLatch lockTaken = new CountDownLatch(1);
+		final AtomicBoolean lockFreeDuringClose = new AtomicBoolean(false);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			Thread contender = new Thread(() -> {
+				synchronized (clientLock) {
+					lockTaken.countDown();
+				}
+			}, "lock-contender");
+			contender.setDaemon(true);
+			contender.start();
+			try {
+				lockFreeDuringClose.set(lockTaken.await(2, TimeUnit.SECONDS));
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		invoke(tahuClient, "discardClientForReconnect");
+
+		Assert.assertTrue(lockFreeDuringClose.get(),
+				"The pre-reconnect discard held clientLock across the Paho close - the callback thread that close "
+						+ "waits for needs the same lock");
+		Assert.assertNull(get(tahuClient, "client"), "The discarded client must not be left installed");
+	}
+
+	/**
 	 * A connect refused during a teardown must be replayed, not lost.
 	 *
 	 * Refusing is right - a connect admitted mid-teardown brings up a second session for the same client id while
