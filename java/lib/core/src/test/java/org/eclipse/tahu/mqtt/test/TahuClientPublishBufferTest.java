@@ -959,54 +959,188 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
-	 * The callback thread has to be recorded by the callbacks themselves.
+	 * The pre-LWT flush gives up when nothing is servicing it, whichever thread is waiting.
 	 *
-	 * The drain wait guard compares against this field, so if nothing ever populates it the guard is inert and the
-	 * futile wait comes back silently. Recorded by identity rather than by matching Paho's "MQTT Call: <clientId>"
-	 * thread name, which is an implementation detail that could change under us without failing anything.
+	 * The wait is starved whenever the callback thread cannot reach deliveryComplete(), and that is not only when
+	 * the waiter is that thread. EdgeClient holds its own clientLock across tahuClient.disconnect() while
+	 * handleStateMessage() blocks on the same lock from the callback thread - deliveryComplete queues behind it and
+	 * never runs. A guard keyed on thread identity cannot see that, because the waiter is EdgeClient's thread and
+	 * the lock belongs to the embedder. Progress can be seen from here; topology cannot.
 	 */
 	@Test(
 			timeOut = TIMEOUT_MS)
-	public void pahosCallbackThreadIsRecordedFromItsCallbacks() throws Exception {
-		wire(8, 8);
-		Assert.assertNull(get(tahuClient, "pahoCallbackThread"),
-				"Precondition: nothing is recorded until a callback actually arrives");
-
-		tahuClient.messageArrived("spBv1.0/STATE/host-1", new MqttMessage("{}".getBytes()));
-
-		Assert.assertSame(get(tahuClient, "pahoCallbackThread"), Thread.currentThread(),
-				"A Paho callback must record the thread it arrived on, or the drain wait guard can never fire");
-	}
-
-	/**
-	 * The pre-LWT flush must not wait on the thread that would have to satisfy it.
-	 *
-	 * A buffer is only non-empty because the in-flight window was exhausted, and the only permit release that lets
-	 * the drain publish is deliveryComplete() - which Paho dispatches on its single callback thread. A disconnect
-	 * taken on that thread therefore blocks its own releaser: it runs the full budget, drains nothing, and the
-	 * buffer is discarded anyway. EdgeClient reaches exactly this, inline from messageArrived, on any offline STATE
-	 * for the configured primary host.
-	 */
-	@Test(
-			timeOut = TIMEOUT_MS)
-	public void theDrainWaitDoesNotRunOnPahosCallbackThread() throws Exception {
+	public void theDrainWaitGivesUpWhenNothingIsServicingIt() throws Exception {
 		wire(0, 8);
 		for (int i = 0; i < 3; i++) {
 			tahuClient.publish("topic/queued-" + i, "x".getBytes(), 1, false);
 		}
 		awaitBufferDepth(3);
 
-		// This test thread stands in for the callback thread, which is how EdgeClient reaches disconnect()
-		set(tahuClient, "pahoCallbackThread", Thread.currentThread());
-
+		// Nothing releases a permit and nothing drains: the shape of a starved wait, on an ordinary thread
 		long start = System.currentTimeMillis();
 		tahuClient.disconnect(0, 1, false, false, false);
 		long elapsed = System.currentTimeMillis() - start;
 
-		Assert.assertTrue(elapsed < LWT_DRAIN_BUDGET_MS, "The flush waited " + elapsed + "ms on the one thread that "
-				+ "could have returned a permit - it can only ever reach its deadline and discard the buffer anyway");
+		Assert.assertTrue(elapsed < LWT_DRAIN_BUDGET_MS, "The flush waited " + elapsed + "ms with neither the buffer "
+				+ "depth nor the permit count moving - nothing was servicing it and it can only reach its deadline");
 		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 3,
 				"Nothing could be flushed, so the loss must still be counted rather than quietly waited over");
+	}
+
+	/**
+	 * A teardown that claims nothing must not release another one's claim.
+	 *
+	 * The gate was a plain boolean with no owner. A scoped teardown whose session is no longer live returns without
+	 * ever setting it, and the finally cleared it anyway - so a second teardown disarmed the first's window while
+	 * its Paho client was still open, reopening every guard that reads the gate for exactly the interval they exist
+	 * to cover.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aScopedTeardownThatDoesNothingDoesNotClearAnotherTeardownsGate() throws Exception {
+		wire(8, 8);
+		final CountDownLatch inTeardown = new CountDownLatch(1);
+		final CountDownLatch releaseTeardown = new CountDownLatch(1);
+		final AtomicBoolean gateHeldThroughout = new AtomicBoolean(true);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			inTeardown.countDown();
+			try {
+				releaseTeardown.await(2, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			gateHeldThroughout.set(tahuClient.isDisconnectInProgress());
+		};
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, false, false);
+			} catch (Exception e) {
+				// reported by the assertions below
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+		Assert.assertTrue(inTeardown.await(3, TimeUnit.SECONDS), "Precondition: the first teardown must be in flight");
+
+		// A second teardown for a session that is not live: it claims nothing, so it must release nothing
+		Method disconnectSession = TahuClient.class.getDeclaredMethod("disconnectSession", TahuMqttAsyncClient.class,
+				long.class, long.class, boolean.class, boolean.class, boolean.class);
+		disconnectSession.setAccessible(true);
+		disconnectSession.invoke(tahuClient, new FakeMqttClient(), 0L, 1L, false, false, false);
+
+		releaseTeardown.countDown();
+		disconnector.join(3000);
+
+		Assert.assertTrue(gateHeldThroughout.get(),
+				"A teardown that tore nothing down cleared the gate of one that was still closing its client");
+	}
+
+	/**
+	 * connect() must mark itself in progress before it releases the lock, not after the close.
+	 *
+	 * detachSession() clears the in-progress flag, and the close that follows runs for at least a second with the
+	 * lock released. Arming only afterwards left a window where the client is null, no connect is in progress and no
+	 * teardown is either - so a second caller passed every gate and started its own ConnectRunnable, leaving two
+	 * live Paho clients for one client id with a reference to only one of them.
+	 *
+	 * Asserted from inside the close, which is the middle of that window - not afterwards, when both orderings look
+	 * the same.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aConnectArmsTheGateBeforeItReleasesTheLock() throws Exception {
+		wire(8, 8);
+		final AtomicBoolean armedDuringClose = new AtomicBoolean(false);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			try {
+				armedDuringClose.set(state(tahuClient));
+			} catch (Exception e) {
+				// reported by the assertion below
+			}
+		};
+
+		try {
+			tahuClient.connect();
+
+			Assert.assertTrue(armedDuringClose.get(),
+					"connect() left the gate unarmed while it closed the previous session - a second connect would "
+							+ "pass every gate in that window and start a second session for the same client id");
+		} finally {
+			// The connect attempt this starts is not a daemon, and there is no MQTT server for it to reach
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
+	 * A connect refused during a teardown must be replayed, not lost.
+	 *
+	 * Refusing is right - a connect admitted mid-teardown brings up a second session for the same client id while
+	 * the old socket is open. But a caller whose only reconnect trigger is one-shot has nothing to retry with:
+	 * TahuHostCallback.connectionLost() calls connect() exactly once, and HostApplication has no run loop behind it.
+	 * Dropping the request leaves that client offline for good, which is the outage the re-arm exists to prevent.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aConnectRefusedDuringATeardownIsDeferredNotDropped() throws Exception {
+		wire(8, 8);
+		final CountDownLatch inTeardown = new CountDownLatch(1);
+		final CountDownLatch releaseTeardown = new CountDownLatch(1);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			inTeardown.countDown();
+			try {
+				releaseTeardown.await(2, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, false, false);
+			} catch (Exception e) {
+				// reported by the assertions below
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+		Assert.assertTrue(inTeardown.await(3, TimeUnit.SECONDS), "Precondition: the teardown must be in flight");
+
+		try {
+			tahuClient.connect();
+			Assert.assertNull(get(tahuClient, "connectRunnable"),
+					"Precondition: the connect must be refused while the teardown holds the gate");
+
+			releaseTeardown.countDown();
+
+			awaitTrue(() -> {
+				try {
+					return get(tahuClient, "connectRunnable") != null;
+				} catch (Exception e) {
+					return false;
+				}
+			}, "The refused connect must run once the teardown finishes - a one-shot caller has no second trigger");
+		} finally {
+			releaseTeardown.countDown();
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
 	}
 
 	/**
@@ -1066,7 +1200,7 @@ public class TahuClientPublishBufferTest {
 	public void aBirthIsNotPublishedWhileADisconnectIsInProgress() throws Exception {
 		wire(8, 8);
 		configureBirth();
-		set(tahuClient, "disconnectInProgress", true);
+		((AtomicInteger) get(tahuClient, "teardownsInFlight")).incrementAndGet();
 
 		tahuClient.publishBirthMessage();
 
@@ -1086,7 +1220,7 @@ public class TahuClientPublishBufferTest {
 	public void anLwtFromAnotherCallerIsNotPublishedWhileADisconnectIsInProgress() throws Exception {
 		wire(8, 8);
 		configureLwt(1);
-		set(tahuClient, "disconnectInProgress", true);
+		((AtomicInteger) get(tahuClient, "teardownsInFlight")).incrementAndGet();
 
 		tahuClient.publishLwt(true);
 
@@ -1783,6 +1917,13 @@ public class TahuClientPublishBufferTest {
 			Thread.sleep(10);
 		}
 		Assert.fail("Buffer depth never reached " + expected + " (currently " + tahuClient.getPublishBufferDepth() + ")");
+	}
+
+	private static boolean state(TahuClient client) throws Exception {
+		Object state = get(client, "state");
+		Method inProgress = state.getClass().getDeclaredMethod("inProgress");
+		inProgress.setAccessible(true);
+		return (Boolean) inProgress.invoke(state);
 	}
 
 	private static TahuClient newTahuClient(ClientCallback clientCallback) throws Exception {

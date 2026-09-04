@@ -27,6 +27,7 @@ import java.util.SortedMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeUnit;
 
 import org.eclipse.paho.client.mqttv3.IMqttActionListener;
@@ -120,6 +121,17 @@ public class TahuClient implements MqttCallbackExtended {
 	 * the MQTT server is genuinely stuck. At 2 seconds a three client pool adds at most 6 seconds to a module stop.
 	 */
 	private static final long LWT_DRAIN_TIMEOUT = 2000;
+
+	/* How long a connect refused during a teardown keeps trying, and how often it looks. */
+	private static final long DEFERRED_CONNECT_TIMEOUT = 30000;
+	private static final long DEFERRED_CONNECT_POLL = 50;
+
+	/*
+	 * How long the pre-LWT flush tolerates seeing no change at all before giving up. The buffer drains in steps -
+	 * a permit returns, depth falls - so an interval with neither moving means nothing is servicing it, whichever
+	 * thread is waiting and whatever lock is in the way.
+	 */
+	private static final long DRAIN_NO_PROGRESS_TIMEOUT = 600;
 
 	private Thread connectRunnableThread;
 	private ConnectRunnable connectRunnable;
@@ -267,15 +279,10 @@ public class TahuClient implements MqttCallbackExtended {
 	 * and two of the three routes into publishBirthMessage() arrive on it - so a wait taken there blocks the only
 	 * thread that could satisfy it, and a teardown taken there re-enters connect() from inside connectComplete().
 	 */
-	/*
-	 * Paho dispatches every callback for a client from one thread. Recorded by identity, not by name: the
-	 * "MQTT Call: <clientId>" name is an implementation detail, and a guard that silently stops matching on an
-	 * upgrade is worse than no guard. Null until the first callback arrives, which is the safe default - it reads as
-	 * "some other thread", and every wait keeps its full budget.
-	 */
-	private volatile Thread pahoCallbackThread;
-
 	private Thread birthRecoveryThread;
+
+	/* Replays a connect that arrived while a teardown held the gate. See scheduleDeferredConnect(). */
+	private Thread deferredConnectThread;
 	private TahuMqttAsyncClient birthRecoverySession;
 
 	private Date connectTime;
@@ -293,7 +300,13 @@ public class TahuClient implements MqttCallbackExtended {
 	 * Read by publish() to tell an interrupt that is part of an intentional disconnect from one that has silently
 	 * dropped a message, so it is written and read from different threads.
 	 */
-	private volatile boolean disconnectInProgress = false;
+	/*
+	 * How many teardowns are in flight, not whether one is. A plain boolean has no owner: a second teardown - or one
+	 * that returns early having claimed nothing - clears it while the first is still closing its Paho client, which
+	 * reopens every guard that reads it for exactly the window they exist to cover. Reads true until the last
+	 * teardown has finished its close.
+	 */
+	private final AtomicInteger teardownsInFlight = new AtomicInteger();
 
 	/*
 	 * Set by publishLwt() so disconnect() can tell whether the death certificate actually reached the MQTT client.
@@ -1115,6 +1128,9 @@ public class TahuClient implements MqttCallbackExtended {
 		logger.info("{}: Waiting up to {}ms for {} buffered publishes to drain before publishing the LWT",
 				getClientId(), timeoutMillis, depth);
 		long deadline = System.currentTimeMillis() + timeoutMillis;
+		int lastDepth = depth;
+		int lastPermits = getAvailablePublishPermits();
+		long lastProgress = System.currentTimeMillis();
 		while (System.currentTimeMillis() < deadline) {
 			if (getPublishBufferDepth() == 0) {
 				logger.debug("{}: Publish buffer drained before the LWT", getClientId());
@@ -1130,21 +1146,27 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			/*
-			 * A buffer is only ever non-empty because the in-flight window was exhausted, and the only permit release
-			 * that lets the drain publish is deliveryComplete() - which Paho dispatches on this very thread. Waiting
-			 * here would block the thread that has to satisfy the wait, so it runs to its deadline, drains nothing,
-			 * and the buffer is discarded anyway. Whatever was publishable with the permits already free has been
-			 * published by the check above; there is nothing left to wait for.
+			 * Give up when nothing is moving, rather than when the waiter happens to be a particular thread.
 			 *
-			 * The other two release sites are failure paths - a message that never reached the client - so a permit
-			 * arriving from one of those would not flush anything either.
+			 * The wait is starved whenever the callback thread cannot reach deliveryComplete(), and that is not only
+			 * when this thread IS the callback thread. Paho dispatches deliveryComplete, messageArrived and
+			 * connectComplete from one queue on one thread, so a callback ahead of deliveryComplete that blocks on
+			 * any lock this waiter holds starves it just as completely - and that lock can belong to the embedder,
+			 * where nothing here can see it. Testing progress instead covers every such topology, including the ones
+			 * we have not thought of.
 			 *
-			 * Every other caller keeps the full budget: for them the acknowledgement really can arrive while they
-			 * wait, and that window is what stops an accepted backlog being discarded unsent.
+			 * A draining buffer moves in steps: a permit returns, depth falls. Neither changing for this long means
+			 * nothing is servicing it.
 			 */
-			if (Thread.currentThread() == pahoCallbackThread && getAvailablePublishPermits() == 0) {
-				logger.debug("{}: Stopped waiting for the publish buffer - on the callback thread with no permits "
-						+ "free, so no acknowledgement can arrive while this waits", getClientId());
+			int currentDepth = getPublishBufferDepth();
+			int currentPermits = getAvailablePublishPermits();
+			if (currentDepth != lastDepth || currentPermits != lastPermits) {
+				lastDepth = currentDepth;
+				lastPermits = currentPermits;
+				lastProgress = System.currentTimeMillis();
+			} else if (System.currentTimeMillis() - lastProgress >= DRAIN_NO_PROGRESS_TIMEOUT) {
+				logger.debug("{}: Stopped waiting for the publish buffer - no progress for {}ms, so nothing is "
+						+ "servicing it", getClientId(), DRAIN_NO_PROGRESS_TIMEOUT);
 				return;
 			}
 			try {
@@ -1509,7 +1531,6 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void connectionLost(Throwable cause) {
-		pahoCallbackThread = Thread.currentThread();
 		logger.debug("{}: MQTT connectionLost() to {} :: {}", getClientId(), getMqttServerName(), getMqttServerUrl());
 		if (logger.isTraceEnabled()) {
 			if (client != null) {
@@ -1538,7 +1559,6 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void deliveryComplete(IMqttDeliveryToken token) {
-		pahoCallbackThread = Thread.currentThread();
 		try {
 			synchronized (lwtDeliveryLock) {
 				if (lwtDeliveryToken != null && lwtDeliveryToken.getMessageId() == token.getMessageId()) {
@@ -1563,7 +1583,6 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void messageArrived(String topic, MqttMessage mqttMessage) throws Exception {
-		pahoCallbackThread = Thread.currentThread();
 		logger.debug("{}: MQTT message arrived on topic {}", getClientId(), topic);
 		numMesgsArrived++;
 		getCallback().messageArrived(getMqttServerName(), getMqttServerUrl(), getClientId(), topic, mqttMessage);
@@ -1591,8 +1610,14 @@ public class TahuClient implements MqttCallbackExtended {
 		 * which is the ordering the lock used to give; waiting here would put this thread back into the cycle the
 		 * teardown was restructured to break.
 		 */
-		if (disconnectInProgress) {
-			logger.debug("{}: Not connecting - a disconnect is in progress", getClientId());
+		if (isDisconnectInProgress()) {
+			/*
+			 * Deferred rather than dropped. A caller whose only reconnect trigger is one-shot - TahuHostCallback's
+			 * connectionLost is exactly that, and HostApplication has no run loop behind it - would otherwise lose
+			 * its single attempt and never come back.
+			 */
+			logger.debug("{}: Deferring the connect - a disconnect is in progress", getClientId());
+			scheduleDeferredConnect();
 			return;
 		}
 
@@ -1619,11 +1644,19 @@ public class TahuClient implements MqttCallbackExtended {
 					return;
 				}
 
-				disconnectInProgress = true;
+				teardownsInFlight.incrementAndGet();
 				detached = detachSession(false, true, true);
+
+				/*
+				 * Armed here, under the lock that detached the old session, rather than after the close. detachSession
+				 * clears it, and between that and re-acquiring the lock the client is null and nothing is in
+				 * progress - so a second connect() passed every gate and started its own ConnectRunnable, leaving two
+				 * live Paho clients for one client id and no reference to close one of them.
+				 */
+				state.setInProgress(true);
 			} catch (Throwable t) {
 				logger.error("{}: Error connecting", getClientId(), t);
-				disconnectInProgress = false;
+				releaseTeardownClaim();
 				return;
 			}
 		}
@@ -1633,12 +1666,11 @@ public class TahuClient implements MqttCallbackExtended {
 		} catch (Exception e) {
 			logger.error("{}: Failed to close the previous session - continuing with the connect", getClientId(), e);
 		} finally {
-			disconnectInProgress = false;
+			releaseTeardownClaim();
 		}
 
 		synchronized (clientLock) {
 			try {
-				state.setInProgress(true);
 				logger.debug("{}: Starting ConnectThread", getClientId());
 				connectRunnable = new ConnectRunnable(this);
 				connectRunnableThread = new Thread(connectRunnable);
@@ -1650,7 +1682,7 @@ public class TahuClient implements MqttCallbackExtended {
 	}
 
 	public boolean isDisconnectInProgress() {
-		return disconnectInProgress;
+		return teardownsInFlight.get() > 0;
 	}
 
 	/**
@@ -1686,15 +1718,22 @@ public class TahuClient implements MqttCallbackExtended {
 	private boolean disconnectSession(TahuMqttAsyncClient expected, long disconnectQuieseTime, long disconnectTimeout,
 			boolean sendDisconnect, boolean publishLwt, boolean waitForLwt) throws TahuException {
 		DetachedSession detached;
+
+		/*
+		 * Outside the try, deliberately. Inside it, this early return would run the finally below and release a claim
+		 * this call never made - clearing another teardown's flag while its client is still open.
+		 */
+		synchronized (clientLock) {
+			if (expected != null && client != expected) {
+				logger.debug("{}: Not disconnecting - the session to tear down is no longer the live one",
+						getClientId());
+				return false;
+			}
+			teardownsInFlight.incrementAndGet();
+		}
+
 		try {
 			synchronized (clientLock) {
-				if (expected != null && client != expected) {
-					logger.debug("{}: Not disconnecting - the session to tear down is no longer the live one",
-							getClientId());
-					return false;
-				}
-
-				disconnectInProgress = true;
 				detached = detachSession(sendDisconnect, publishLwt, waitForLwt);
 
 				// reset the timers if needed
@@ -1707,10 +1746,59 @@ public class TahuClient implements MqttCallbackExtended {
 
 			closeDetachedSession(detached, disconnectQuieseTime, disconnectTimeout);
 		} finally {
-			disconnectInProgress = false;
+			releaseTeardownClaim();
 		}
 
 		return detached != null;
+	}
+
+	/** Releases one teardown claim, and never takes the count below zero if a caller unbalances it. */
+	private void releaseTeardownClaim() {
+		int remaining = teardownsInFlight.decrementAndGet();
+		if (remaining < 0) {
+			logger.error("{}: Teardown claim released more often than it was taken - correcting", getClientId());
+			teardownsInFlight.set(0);
+		}
+	}
+
+	/**
+	 * Replays a connect that was refused because a teardown held the gate.
+	 *
+	 * On a worker, and never by waiting in connect() itself: the teardown this waits on ends inside Paho's
+	 * CommsCallback.stop(), which spin waits for the callback thread - so a connect() arriving on that thread and
+	 * waiting inline would be the same two party deadlock the teardown was restructured to break. Bounded, because a
+	 * teardown that never finishes must not leave a thread here for the life of the JVM.
+	 */
+	private void scheduleDeferredConnect() {
+		synchronized (clientLock) {
+			if (deferredConnectThread != null && deferredConnectThread.isAlive()) {
+				logger.debug("{}: A deferred connect is already pending", getClientId());
+				return;
+			}
+
+			deferredConnectThread = new Thread(() -> {
+				long deadline = System.currentTimeMillis() + DEFERRED_CONNECT_TIMEOUT;
+				while (System.currentTimeMillis() < deadline) {
+					if (!isDisconnectInProgress()) {
+						logger.debug("{}: Teardown finished - running the deferred connect", getClientId());
+						connect();
+						return;
+					}
+
+					try {
+						Thread.sleep(DEFERRED_CONNECT_POLL);
+					} catch (InterruptedException e) {
+						Thread.currentThread().interrupt();
+						return;
+					}
+				}
+
+				logger.warn("{}: Gave up on the deferred connect - a teardown was still in progress after {}ms",
+						getClientId(), DEFERRED_CONNECT_TIMEOUT);
+			}, "TahuDeferredConnect-" + getClientId().getMqttClientId());
+			deferredConnectThread.setDaemon(true);
+			deferredConnectThread.start();
+		}
 	}
 
 	/**
@@ -1769,9 +1857,10 @@ public class TahuClient implements MqttCallbackExtended {
 			 * returning null told those callers the messages were queued, not lost. The LWT is the reason the wait
 			 * happens first, not the reason it happens.
 			 *
-			 * This still runs under clientLock, and it waits for a permit that only deliveryComplete() returns. That
-			 * is safe for exactly one reason: deliveryComplete() is the one Paho callback that never needs
-			 * clientLock. Adding a clientLock path to it would turn this wait into a hang.
+			 * This still runs under clientLock, and it waits for a permit that only deliveryComplete() returns. It is
+			 * not safe by virtue of any lock discipline here - the callback thread can be blocked on a lock this
+			 * client knows nothing about, in the embedder - so the wait itself gives up as soon as it sees no
+			 * progress rather than relying on who is waiting.
 			 */
 			if (client.isConnected()) {
 				awaitPublishBufferDrained(LWT_DRAIN_TIMEOUT);
@@ -2341,10 +2430,9 @@ public class TahuClient implements MqttCallbackExtended {
 
 	@Override
 	public void connectComplete(boolean reconnect, String serverURI) {
-		pahoCallbackThread = Thread.currentThread();
 
 		// Check if we are in the process of disconnecting
-		if (disconnectInProgress) {
+		if (isDisconnectInProgress()) {
 			logger.warn("{}: Ignoring connect complete to {}, disconnect in progress", getClientId(), serverURI);
 			// This potentially prevents a deadlock situation upon synchronizing on the clientLock below if a disconnect
 			// is in progress and waiting on the client.disconnect() call
@@ -2539,7 +2627,7 @@ public class TahuClient implements MqttCallbackExtended {
 		 * teardown holds this lock across a bounded buffer drain - so a callback thread arriving here would park on
 		 * it for that long, stalling every other callback for this client, only to find a session that is gone.
 		 */
-		if (disconnectInProgress) {
+		if (isDisconnectInProgress()) {
 			logger.debug("{}: Not publishing the BIRTH - a disconnect is in progress", getClientId());
 			return;
 		}
@@ -2789,7 +2877,7 @@ public class TahuClient implements MqttCallbackExtended {
 		 * the death certificate through publishLwtNow() rather than through here. Guarding that call too would skip
 		 * the LWT on every disconnect, which is the one moment it exists for.
 		 */
-		if (disconnectInProgress) {
+		if (isDisconnectInProgress()) {
 			logger.debug("{}: Not publishing the LWT - a disconnect is in progress and will publish it", getClientId());
 			return;
 		}
