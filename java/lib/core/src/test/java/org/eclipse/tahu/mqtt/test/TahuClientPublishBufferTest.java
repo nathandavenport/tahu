@@ -45,6 +45,7 @@ import org.eclipse.tahu.mqtt.ClientCallback;
 import org.eclipse.tahu.mqtt.MqttClientId;
 import org.eclipse.tahu.mqtt.MqttServerName;
 import org.eclipse.tahu.mqtt.MqttServerUrl;
+import org.eclipse.tahu.mqtt.RandomStartupDelay;
 import org.eclipse.tahu.mqtt.TahuClient;
 import org.eclipse.tahu.mqtt.TahuMqttAsyncClient;
 import org.testng.Assert;
@@ -75,6 +76,10 @@ public class TahuClientPublishBufferTest {
 
 	/* Long enough for several full teardowns, each of which pays the unconditional 1000ms Paho workaround sleep. */
 	private static final long STRESS_DURATION_MS = 6000;
+
+	/* Long enough that a lock held for its duration is unmistakable, and that the probe lands well inside it. */
+	private static final long STARTUP_DELAY_MS = 3000;
+	private static final long LOCK_PROBE_BUDGET_MS = 1000;
 
 	/* The BIRTH backpressure budget (500ms) plus the Paho workaround sleep (1000ms), with room to settle. */
 	private static final long BIRTH_WAIT_PLUS_SLACK = 2200;
@@ -1632,6 +1637,68 @@ public class TahuClientPublishBufferTest {
 						+ "asked for it, so it reconnects whatever is there when the last claim drops");
 		Assert.assertFalse((Boolean) get(tahuClient, "deferredConnectPending"),
 				"The replay must not still be armed once the teardown has finished");
+	}
+
+	/**
+	 * The random startup delay must not be served holding clientLock.
+	 *
+	 * RandomStartupDelay is configured in milliseconds and exists to stagger a fleet's reconnects, so it is meant
+	 * to be long. It is drawn fresh before every attempt in the retry loop, which is the feature - clients sharing
+	 * a connect retry interval return from a common outage in lockstep and only new jitter re-scatters them - and
+	 * that loop spins for as long as the server is unreachable. Served under the lock, every publish, teardown and
+	 * connectComplete on this client queues behind a timer, and so does disconnect().
+	 *
+	 * The probe measures the property directly rather than the delay: while the delay is being served, another
+	 * thread must be able to take clientLock. The margins are a whole second either side of a three second delay,
+	 * so this is not a threshold the passing path comes near.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 4)
+	public void theRandomStartupDelayIsNotServedHoldingClientLock() throws Exception {
+		wire(8, 8);
+		set(tahuClient, "randomStartupDelay", new RandomStartupDelay(STARTUP_DELAY_MS + "-" + STARTUP_DELAY_MS));
+		final Object clientLock = get(tahuClient, "clientLock");
+
+		Thread connector = new Thread(() -> tahuClient.connect(), "connector");
+		connector.setDaemon(true);
+		connector.start();
+
+		try {
+			awaitTrue(() -> {
+				try {
+					return get(tahuClient, "connectRunnableThread") != null;
+				} catch (Exception e) {
+					return false;
+				}
+			}, "Precondition: the connect runnable must start");
+
+			// Past the brief acquisitions run() makes before the loop, and well inside the delay itself
+			Thread.sleep(400);
+
+			final CountDownLatch acquired = new CountDownLatch(1);
+			Thread probe = new Thread(() -> {
+				synchronized (clientLock) {
+					acquired.countDown();
+				}
+			}, "lock-probe");
+			probe.setDaemon(true);
+			probe.start();
+
+			Assert.assertTrue(acquired.await(LOCK_PROBE_BUDGET_MS, TimeUnit.MILLISECONDS),
+					"clientLock was still held " + LOCK_PROBE_BUDGET_MS + "ms into a " + STARTUP_DELAY_MS
+							+ "ms startup delay. Every operation on this client is queued behind a timer for the "
+							+ "length of it, on every attempt, for as long as the server stays unreachable");
+		} finally {
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+			connector.join(5000);
+		}
 	}
 
 	/**

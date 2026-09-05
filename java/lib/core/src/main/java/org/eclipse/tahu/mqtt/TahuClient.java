@@ -2007,6 +2007,7 @@ public class TahuClient implements MqttCallbackExtended {
 			if (publishLwt) {
 				/*
 				 * A failed LWT publish must not abort the disconnect - the session has to come down either way.
+				 *
 				 */
 				try {
 					this.publishLwtNow(waitForLwt);
@@ -2115,6 +2116,41 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
+	/**
+	 * Waits out the configured random startup delay, if there is one.
+	 *
+	 * Called with no lock held, and deliberately not from inside {@link #attemptConnect}: both of that method's
+	 * callers already hold {@link #clientLock} across the call, so a sleep anywhere inside it holds the lock for
+	 * the whole delay. RandomStartupDelay is configured in milliseconds and exists to stagger a fleet, so it is
+	 * meant to be long - long enough that every publish, teardown and connectComplete on this client would queue
+	 * behind a timer, and disconnect() with it.
+	 *
+	 * The delay is drawn fresh on each call rather than once per client, and this keeps that: clients sharing a
+	 * connect retry interval come back from a common outage in lockstep, and only new jitter re-scatters them.
+	 *
+	 * Taken before the already-connected check rather than after it, which is the one behavioural change. The cost
+	 * is a delay paid on an attempt that then finds itself connected; the alternative is to check, release, sleep
+	 * and re-acquire, which splits the check from the connect it authorises.
+	 */
+	private void awaitRandomStartupDelay() {
+		if (randomStartupDelay == null || !randomStartupDelay.isValid()) {
+			return;
+		}
+
+		long randomDelay = randomStartupDelay.getRandomDelay();
+		logger.debug("{}: Waiting random delay of {} ms before reconnect attempt", getClientId(), randomDelay);
+		try {
+			Thread.sleep(randomDelay);
+		} catch (InterruptedException e) {
+			/*
+			 * Restored and swallowed, as it was when this sat inside attemptConnect. The caller goes on to attempt
+			 * the connect; changing that to give up is a separate question from where the sleep happens.
+			 */
+			Thread.currentThread().interrupt();
+			logger.warn("{}: Sleep interrupted", getClientId(), e);
+		}
+	}
+
 	/*
 	 * Attempt to connect.
 	 */
@@ -2124,16 +2160,6 @@ public class TahuClient implements MqttCallbackExtended {
 			if (isConnected()) {
 				logger.trace("{} is already connected - not trying again", getClientId());
 				return null;
-			}
-			if (randomStartupDelay != null && randomStartupDelay.isValid()) {
-				long randomDelay = randomStartupDelay.getRandomDelay();
-				logger.debug("{}: Waiting random delay of {} ms before reconnect attempt", getClientId(), randomDelay);
-				try {
-					Thread.sleep(randomDelay);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					logger.warn("{}: Sleep interrupted", getClientId(), e);
-				}
 			}
 
 			logger.debug("{}: Attempting {} to {}", getClientId(), ctx, getMqttServerUrl());
@@ -2275,6 +2301,10 @@ public class TahuClient implements MqttCallbackExtended {
 					try {
 						while (!isConnected() && attemptConnects) {
 							try {
+								// Inside the loop, outside the lock: once per attempt, as before, but without
+								// holding clientLock for the length of it
+								awaitRandomStartupDelay();
+
 								synchronized (clientLock) {
 									if (!attemptConnects) {
 										logger.info("{}: No longer attempting to connect", getClientId());
@@ -2343,6 +2373,8 @@ public class TahuClient implements MqttCallbackExtended {
 					}
 				} else {
 					try {
+						awaitRandomStartupDelay();
+
 						synchronized (clientLock) {
 							if (!attemptConnects) {
 								logger.info("{}: No longer attempting to connect", getClientId());
