@@ -1753,6 +1753,80 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * A correction to an unbalanced release must still run the replay it was about to run.
+	 *
+	 * releaseTeardownClaim() floors the count at zero when a caller unbalances it, and the replay is gated on the
+	 * count reaching zero. Correcting the field but not the local leaves the gate reading a negative number that
+	 * never equals zero, so a connect refused during a teardown stays armed with nothing left to fire it - the
+	 * counter is repaired and the client stays offline, which is the outcome the deferral exists to prevent.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 2)
+	public void aCorrectedUnbalancedReleaseStillRunsThePendingConnect() throws Exception {
+		wire(8, 8);
+		final AtomicInteger teardowns = (AtomicInteger) get(tahuClient, "teardownsInFlight");
+		Assert.assertEquals(teardowns.get(), 0, "Precondition: no teardown is in flight");
+		set(tahuClient, "deferredConnectPending", true);
+
+		try {
+			// One more release than there were claims - the case the correction exists for
+			invoke(tahuClient, "releaseTeardownClaim");
+
+			Assert.assertEquals(teardowns.get(), 0, "The count must be floored at zero, not left negative");
+			awaitTrue(() -> {
+				try {
+					return get(tahuClient, "connectRunnable") != null;
+				} catch (Exception e) {
+					return false;
+				}
+			}, "The armed replay must still run - the count was corrected to zero, so the gate it feeds must see "
+					+ "zero too");
+		} finally {
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
+	 * A connect that throws before it claims must not release a claim.
+	 *
+	 * connect() takes its teardown claim partway through a try whose catch releases one. Everything above the
+	 * increment can throw - the timer reset and the in-progress gate both run first - and releasing there drives
+	 * the count negative. The correction in releaseTeardownClaim() then resets it to zero, which is a claim
+	 * another teardown may still be holding, and reaching zero also consumes any armed replay.
+	 *
+	 * Driven by removing the connect state, which is what the gate above the increment dereferences. Any throw on
+	 * that stretch does the same thing; this is the one a test can produce.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aConnectThatThrowsBeforeClaimingDoesNotReleaseAClaim() throws Exception {
+		wire(8, 8);
+		final AtomicInteger teardowns = (AtomicInteger) get(tahuClient, "teardownsInFlight");
+		Object state = get(tahuClient, "state");
+		set(tahuClient, "deferredConnectPending", true);
+
+		try {
+			set(tahuClient, "state", null);
+			tahuClient.connect();
+
+			Assert.assertEquals(teardowns.get(), 0, "The count must not have moved - this call never claimed");
+			Assert.assertTrue((Boolean) get(tahuClient, "deferredConnectPending"),
+					"A connect that failed before claiming released a claim it never took. The release drove the "
+							+ "count negative, and reaching zero consumed a replay that is still waiting for the "
+							+ "teardown which actually holds the gate");
+		} finally {
+			set(tahuClient, "state", state);
+		}
+	}
+
+	/**
 	 * A connect during a teardown must be refused, not raced.
 	 *
 	 * The teardown clears the client field before closing the Paho client, so for the length of that close -
