@@ -1802,6 +1802,19 @@ public class TahuClient implements MqttCallbackExtended {
 				}
 			}
 
+			/*
+			 * Before the close and outside clientLock. Before, because the point of confirming the death
+			 * certificate is to know it left before the socket goes. Outside, because the confirmation arrives on
+			 * Paho's callback thread by way of deliveryComplete(), and that thread needs clientLock.
+			 *
+			 * Still inside the teardown claim, which is what binds the wait to this session: while a claim is held
+			 * isDisconnectInProgress() is true, so connect() defers rather than starting a ConnectRunnable, and no
+			 * new session can be installed underneath it.
+			 */
+			if (detached != null && detached.awaitLwtDeliveryToken != null) {
+				awaitLwtDelivery(detached.awaitLwtDeliveryToken);
+			}
+
 			closeDetachedSession(detached, disconnectQuieseTime, disconnectTimeout);
 		} finally {
 			if (claimed) {
@@ -1979,6 +1992,7 @@ public class TahuClient implements MqttCallbackExtended {
 			}
 
 			boolean sendDisconnectPacket = sendDisconnect;
+			IMqttDeliveryToken awaitLwtDeliveryToken = null;
 			/*
 			 * Give the buffer a bounded chance to drain BEFORE the LWT, so the LWT can go out inline at its
 			 * configured QoS and be acknowledged. The drain thread is still running at this point; it is stopped
@@ -2008,9 +2022,20 @@ public class TahuClient implements MqttCallbackExtended {
 				/*
 				 * A failed LWT publish must not abort the disconnect - the session has to come down either way.
 				 *
+				 * Published here, under clientLock, and confirmed by disconnectSession() after the lock is
+				 * released. isLwtDeliveryComplete() polls for keepAlive * 4 quarter seconds - keepAlive seconds,
+				 * 30 by default - for a confirmation that arrives on Paho's callback thread, and that thread needs
+				 * clientLock for connectComplete. Waiting here held the lock for the whole of it and blocked one of
+				 * the threads the wait depends on. Same split as the Paho close: the part that can wait on the
+				 * callback thread runs with the lock released.
 				 */
 				try {
-					this.publishLwtNow(waitForLwt);
+					this.publishLwtNow(false);
+					if (waitForLwt) {
+						synchronized (lwtDeliveryLock) {
+							awaitLwtDeliveryToken = lwtDeliveryToken;
+						}
+					}
 				} catch (Exception e) {
 					logger.error("{}: Failed to publish the LWT during disconnect - continuing", getClientId(), e);
 				}
@@ -2037,7 +2062,7 @@ public class TahuClient implements MqttCallbackExtended {
 			 * discarded and counted by getPublishBufferDiscardedMessageCount().
 			 */
 			shutdownPublishBufferDrainThreadQuietly();
-			DetachedSession detached = new DetachedSession(client, sendDisconnectPacket);
+			DetachedSession detached = new DetachedSession(client, sendDisconnectPacket, awaitLwtDeliveryToken);
 			client = null;
 			return detached;
 		} finally {
@@ -2104,15 +2129,24 @@ public class TahuClient implements MqttCallbackExtended {
 		}
 	}
 
-	/** A session that has been detached under clientLock and still needs its Paho client closed outside it. */
+	/**
+	 * A session that has been detached under clientLock and still needs its Paho client closed outside it.
+	 *
+	 * awaitLwtDeliveryToken is the death certificate this teardown published, when the caller asked for its
+	 * delivery to be confirmed. It travels with the session for the same reason the client does: confirming it
+	 * means waiting on Paho's callback thread, which cannot be done holding clientLock.
+	 */
 	private static final class DetachedSession {
 
 		private final TahuMqttAsyncClient client;
 		private final boolean sendDisconnectPacket;
+		private final IMqttDeliveryToken awaitLwtDeliveryToken;
 
-		private DetachedSession(TahuMqttAsyncClient client, boolean sendDisconnectPacket) {
+		private DetachedSession(TahuMqttAsyncClient client, boolean sendDisconnectPacket,
+				IMqttDeliveryToken awaitLwtDeliveryToken) {
 			this.client = client;
 			this.sendDisconnectPacket = sendDisconnectPacket;
+			this.awaitLwtDeliveryToken = awaitLwtDeliveryToken;
 		}
 	}
 
@@ -3212,6 +3246,46 @@ public class TahuClient implements MqttCallbackExtended {
 	 * It uses the 'keepAlive' to timeout if the lwtDeliveryToken is not cleared by the deliveryComplete() 
 	 * Paho callback.
 	 */
+	/**
+	 * Waits for one specific death certificate to be acknowledged, with no lock held.
+	 *
+	 * Bound to the token it was given rather than to the field. The field is the live LWT token and another
+	 * teardown can replace it - two teardowns can hold claims at once - so a wait that polled the field could be
+	 * satisfied, or kept waiting, by a publish that is not the one it is confirming.
+	 *
+	 * Same budget as {@link #isLwtDeliveryComplete()}: keepAlive * 4 quarter seconds. The difference is that
+	 * nothing is blocked while it runs.
+	 */
+	private void awaitLwtDelivery(IMqttDeliveryToken expected) {
+		int counter = keepAlive * 4;
+		for (int i = 0; i < counter; i++) {
+			synchronized (lwtDeliveryLock) {
+				if (lwtDeliveryToken != expected) {
+					logger.info("{}: LWT delivery confirmation - done waiting", getClientId());
+					return;
+				}
+			}
+			try {
+				Thread.sleep(250);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				logger.warn("{}: Interrupted while waiting for LWT", getClientId());
+				return;
+			}
+		}
+
+		/*
+		 * Cleared only if it is still ours. The unconditional clear in isLwtDeliveryComplete() is safe there
+		 * because that runs under clientLock; here another teardown may have published since.
+		 */
+		synchronized (lwtDeliveryLock) {
+			if (lwtDeliveryToken == expected) {
+				lwtDeliveryToken = null;
+			}
+		}
+		logger.warn("{}: LWT delivery confirmation - timeout", getClientId());
+	}
+
 	private boolean isLwtDeliveryComplete() {
 		int counter = keepAlive * 4;
 		for (int i = 0; i < counter; i++) {

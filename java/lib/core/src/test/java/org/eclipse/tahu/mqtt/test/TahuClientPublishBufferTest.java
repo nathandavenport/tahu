@@ -1702,6 +1702,57 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * A graceful disconnect must not hold clientLock waiting for the death certificate to be acknowledged.
+	 *
+	 * isLwtDeliveryComplete() polls for keepAlive * 4 quarter seconds - keepAlive seconds, 30 here - and the
+	 * confirmation it waits for arrives on Paho's callback thread by way of deliveryComplete(). That thread needs
+	 * clientLock for connectComplete, so waiting under the lock blocks one of the threads the wait depends on, and
+	 * every other operation on the client for the same period. HostApplication's shutdown is the caller that
+	 * reaches it: disconnect(100, 100, true, true), whose four argument overload forwards publishLwt = true.
+	 *
+	 * The wait itself is kept - a graceful disconnect wants the certificate confirmed, unlike the reconnect path,
+	 * which drops it because the session is being replaced anyway. Only the lock is given up, and the wait is bound
+	 * to the token it published rather than to the live field.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 4)
+	public void aGracefulDisconnectDoesNotHoldClientLockWaitingForTheLwtAcknowledgement() throws Exception {
+		wire(8, 8);
+		configureLwt(1);
+
+		// Nothing will acknowledge it, so the wait can only run to its full keepAlive budget
+		fakeClient.shutdownAckThread();
+		final Object clientLock = get(tahuClient, "clientLock");
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, true, true);
+			} catch (Exception e) {
+				// reported by the assertion below
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+
+		// Past the detach and into the wait, with the whole keepAlive budget still ahead of it
+		Thread.sleep(1200);
+
+		final CountDownLatch acquired = new CountDownLatch(1);
+		Thread probe = new Thread(() -> {
+			synchronized (clientLock) {
+				acquired.countDown();
+			}
+		}, "lock-probe");
+		probe.setDaemon(true);
+		probe.start();
+
+		Assert.assertTrue(acquired.await(LOCK_PROBE_BUDGET_MS, TimeUnit.MILLISECONDS),
+				"clientLock was still held " + LOCK_PROBE_BUDGET_MS + "ms into the LWT acknowledgement wait. That "
+						+ "wait runs for keepAlive seconds and is satisfied by Paho's callback thread, which needs "
+						+ "this lock - so it blocks a thread it depends on, and every other operation meanwhile");
+	}
+
+	/**
 	 * A connect during a teardown must be refused, not raced.
 	 *
 	 * The teardown clears the client field before closing the Paho client, so for the length of that close -
