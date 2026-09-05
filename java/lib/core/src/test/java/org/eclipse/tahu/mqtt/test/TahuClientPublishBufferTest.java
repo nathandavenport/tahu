@@ -13,6 +13,10 @@
 
 package org.eclipse.tahu.mqtt.test;
 
+import java.lang.management.ManagementFactory;
+import java.lang.management.MonitorInfo;
+import java.lang.management.ThreadInfo;
+import java.lang.management.ThreadMXBean;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -62,6 +66,15 @@ public class TahuClientPublishBufferTest {
 
 	/* The pre-LWT drain budget, plus the Paho workaround sleep the disconnect pays regardless. */
 	private static final long LWT_DRAIN_BUDGET_MS = 2000;
+
+	/*
+	 * Comfortably under the keepAlive-second LWT confirmation wait (30s here) and comfortably over the second the
+	 * close legitimately costs, so it fails on the wait and not on the grace period.
+	 */
+	private static final long LWT_CONFIRMATION_BUDGET_MS = 5000;
+
+	/* Long enough for several full teardowns, each of which pays the unconditional 1000ms Paho workaround sleep. */
+	private static final long STRESS_DURATION_MS = 6000;
 
 	/* The BIRTH backpressure budget (500ms) plus the Paho workaround sleep (1000ms), with room to settle. */
 	private static final long BIRTH_WAIT_PLUS_SLACK = 2200;
@@ -976,15 +989,33 @@ public class TahuClientPublishBufferTest {
 		}
 		awaitBufferDepth(3);
 
-		// Nothing releases a permit and nothing drains: the shape of a starved wait, on an ordinary thread
+		/*
+		 * The wait itself, not the whole disconnect. Measuring disconnect() puts the unconditional 1000ms Paho
+		 * workaround sleep inside the assertion, which left about 180ms of headroom over four sleeps - a threshold
+		 * the passing path very nearly reaches, so it would fail on a loaded runner with no defect present.
+		 */
+		Method awaitDrained = TahuClient.class.getDeclaredMethod("awaitPublishBufferDrained", long.class);
+		awaitDrained.setAccessible(true);
+
 		long start = System.currentTimeMillis();
-		tahuClient.disconnect(0, 1, false, false, false);
+		awaitDrained.invoke(tahuClient, LWT_DRAIN_BUDGET_MS);
 		long elapsed = System.currentTimeMillis() - start;
 
 		Assert.assertTrue(elapsed < LWT_DRAIN_BUDGET_MS, "The flush waited " + elapsed + "ms with neither the buffer "
 				+ "depth nor the permit count moving - nothing was servicing it and it can only reach its deadline");
-		Assert.assertEquals(tahuClient.getPublishBufferDiscardedMessageCount(), 3,
-				"Nothing could be flushed, so the loss must still be counted rather than quietly waited over");
+
+		/*
+		 * Bounded below as well, because "gives up" and "gives up too early" are different defects and only the
+		 * first was being checked. The no-progress window is half the budget, so a give-up well short of that is a
+		 * threshold that does not scale with the budget it is spending - and a fixed one cannot distinguish a
+		 * stalled servicer from a server whose acknowledgements are merely slower than the constant, which is the
+		 * case this must not mistake. 100ms of slack: the loop samples every 50ms and the bound is 1000ms.
+		 */
+		Assert.assertTrue(elapsed >= (LWT_DRAIN_BUDGET_MS / 2) - 100,
+				"The flush gave up after " + elapsed + "ms, short of half its " + LWT_DRAIN_BUDGET_MS + "ms budget - "
+						+ "a no-progress window that does not scale with the budget spends only a fraction of it and "
+						+ "reads a slow acknowledgement round trip as a stalled one");
+		Assert.assertEquals(tahuClient.getPublishBufferDepth(), 3, "Nothing could drain, so nothing may have drained");
 	}
 
 	/**
@@ -1082,6 +1113,180 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * Drive the session lifecycle from several threads at once and assert the coordination state survives it.
+	 *
+	 * Every finding in rounds 3 to 6 was an interleaving, and none of them is visible to a single threaded test -
+	 * the code is correct when one thread runs it. Mutation testing asks whether a test notices a changed line; it
+	 * cannot ask what happens between two lines. This is the shape of test that can.
+	 *
+	 * It asserts the invariants the coordination state has to hold rather than any particular outcome: the teardown
+	 * count never goes negative and returns to zero, no operation throws anything unexpected, and - the point of the
+	 * timeOut - nothing wedges. A deadlock fails this by never finishing.
+	 */
+	@Test(
+			timeOut = 60000)
+	public void concurrentLifecycleOperationsDoNotWedgeOrCorruptState() throws Exception {
+		wire(8, 8);
+		configureBirth();
+		configureLwt(1);
+
+		final AtomicInteger teardowns = (AtomicInteger) get(tahuClient, "teardownsInFlight");
+		final AtomicReference<Throwable> failure = new AtomicReference<>();
+		final AtomicBoolean negativeSeen = new AtomicBoolean(false);
+		final AtomicBoolean stop = new AtomicBoolean(false);
+		final CountDownLatch started = new CountDownLatch(7);
+
+		Runnable guard = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				if (teardowns.get() < 0) {
+					negativeSeen.set(true);
+				}
+				Thread.yield();
+			}
+		};
+
+		Runnable reinstaller = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					// Stands in for a connect completing: a fresh session appears under the old one's feet
+					set(tahuClient, "client", new FakeMqttClient());
+					set(tahuClient, "semaphore", new Semaphore(8, true));
+					Thread.sleep(40);
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		Runnable disconnector = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					tahuClient.disconnect(0, 1, false, false, false);
+				} catch (TahuException expected) {
+					// A disconnect racing another one is allowed to fail; wedging is not
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		Runnable publisher = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					tahuClient.publish("topic/stress", "x".getBytes(), 1, false);
+				} catch (TahuException expected) {
+					// Rejected because the session went away mid publish - the documented outcome
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		Runnable callbacks = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					// Paho delivers these from one thread; here they race everything else
+					tahuClient.messageArrived("spBv1.0/STATE/host-1", new MqttMessage("{}".getBytes()));
+					tahuClient.publishBirthMessage();
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		Runnable lwt = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					tahuClient.publishLwt(false);
+				} catch (TahuException | MqttException expected) {
+					// Same as publish: losing the session mid call is allowed
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		/*
+		 * connect() has to be in the mix. It is where the gate, the claim, the in-progress flag and the deferral all
+		 * interact, and a stress test that leaves it out exercises the state without exercising its coordination -
+		 * which is how the first version of this test passed against code with four known defects in it.
+		 *
+		 * Its ConnectRunnable reaches a real socket, refused immediately since nothing is listening, and every
+		 * disconnect above stops whichever one is current.
+		 */
+		Runnable connector = () -> {
+			started.countDown();
+			while (!stop.get()) {
+				try {
+					tahuClient.connect();
+					Thread.sleep(30);
+				} catch (Throwable t) {
+					failure.compareAndSet(null, t);
+					return;
+				}
+			}
+		};
+
+		List<Thread> threads = new ArrayList<>();
+		for (Runnable r : List.of(guard, reinstaller, disconnector, publisher, callbacks, lwt, connector)) {
+			Thread t = new Thread(r, "stress-" + threads.size());
+			t.setDaemon(true);
+			threads.add(t);
+			t.start();
+		}
+
+		Assert.assertTrue(started.await(5, TimeUnit.SECONDS), "Stress threads never started");
+		Thread.sleep(STRESS_DURATION_MS);
+		stop.set(true);
+		for (Thread t : threads) {
+			t.join(15000);
+			if (t.isAlive()) {
+				Assert.fail("Thread " + t.getName() + " did not finish - something is wedged\n" + dumpThreads());
+			}
+		}
+
+		// Stop whatever connect attempt is still running before asserting
+		Object connectRunnable = get(tahuClient, "connectRunnable");
+		if (connectRunnable != null) {
+			invoke(connectRunnable, "stopConnectAttempts");
+		}
+		Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+		if (connectThread != null) {
+			connectThread.interrupt();
+		}
+
+		if (failure.get() != null) {
+			throw new AssertionError("A lifecycle operation threw under contention", failure.get());
+		}
+		Assert.assertFalse(negativeSeen.get(),
+				"The teardown count went negative - a claim was released by something that never took one");
+		/*
+		 * Settled rather than read once. The client starts workers of its own - the deferred connect and the BIRTH
+		 * recovery - which the test cannot join, so one can be mid teardown with a claim taken at the instant the
+		 * stress threads finish. Reading the counter there measures the test's timing, not the client's balance.
+		 */
+		long settleBy = System.currentTimeMillis() + 10000;
+		while (teardowns.get() != 0 && System.currentTimeMillis() < settleBy) {
+			Thread.sleep(50);
+		}
+		if (teardowns.get() != 0) {
+			Assert.fail("Teardown claims did not settle - " + teardowns.get() + " still outstanding after 10s, so one "
+					+ "was taken and never released and the gate is stuck closed.\n" + dumpThreads());
+		}
+	}
+
+	/**
 	 * A disconnect that finds no client must still clear the connect-in-progress flag.
 	 *
 	 * A connect attempt that is still building its Paho client has state.inProgress() true and the field still
@@ -1144,6 +1349,47 @@ public class TahuClientPublishBufferTest {
 	}
 
 	/**
+	 * A reconnect must not hold clientLock waiting for the old session's death certificate to be confirmed.
+	 *
+	 * connect() tears the previous session down before building a new one, and that teardown published the LWT and
+	 * then waited for delivery confirmation - isLwtDeliveryComplete() polls for keepAlive * 4 quarter seconds, so
+	 * keepAlive seconds, 30 here. The confirmation arrives on Paho's callback thread, and clientLock is held
+	 * throughout, so every other operation on the client queues behind a reconnect for that long. Found by the
+	 * concurrency stress test, which wedged here; it predates this branch.
+	 *
+	 * The LWT still goes out - only the wait for its acknowledgement is gone, and closeDetachedSession() pays an
+	 * unconditional second with the lock released, which is the same grace period.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 3)
+	public void aReconnectDoesNotHoldClientLockWaitingForLwtConfirmation() throws Exception {
+		wire(8, 8);
+		configureLwt(1);
+
+		// Nothing will acknowledge the LWT, so a wait for confirmation can only run to its full keepAlive budget
+		fakeClient.shutdownAckThread();
+
+		try {
+			long start = System.currentTimeMillis();
+			tahuClient.connect();
+			long elapsed = System.currentTimeMillis() - start;
+
+			Assert.assertTrue(elapsed < LWT_CONFIRMATION_BUDGET_MS,
+					"connect() took " + elapsed + "ms - it waited under clientLock for an LWT acknowledgement that "
+							+ "was never coming, blocking every other operation on this client meanwhile");
+		} finally {
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
 	 * A connect refused during a teardown must be replayed, not lost.
 	 *
 	 * Refusing is right - a connect admitted mid-teardown brings up a second session for the same client id while
@@ -1203,6 +1449,189 @@ public class TahuClientPublishBufferTest {
 				connectThread.interrupt();
 			}
 		}
+	}
+
+	/**
+	 * The replayed connect must not run with its own interrupt flag set.
+	 *
+	 * detachSession() cancels a pending deferral and interrupts the worker that would run it, so that a connect
+	 * refused moments before a shutdown cannot still land after it. The worker runs connect(), and connect() calls
+	 * detachSession() - so on the replay path that cancellation is the worker interrupting itself, every time.
+	 *
+	 * It is not cosmetic. Everything the teardown does after that point is a timed wait: awaitPublishBufferDrained()
+	 * returns at its first sleep, so the pre-LWT drain is skipped and whatever was buffered is discarded, and
+	 * closeDetachedSession()'s unconditional second - the grace period the LWT needs to reach the server before the
+	 * socket is torn down - is skipped too. connect() gives up waiting for the LWT acknowledgement specifically
+	 * because that second is there to cover it, so on this one path the death certificate has no cover at all.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 3)
+	public void theDeferredConnectReplayDoesNotInterruptItself() throws Exception {
+		wire(8, 8);
+		configureLwt(1);
+
+		final CountDownLatch inTeardown = new CountDownLatch(1);
+		final CountDownLatch releaseTeardown = new CountDownLatch(1);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			inTeardown.countDown();
+			try {
+				releaseTeardown.await(5, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, false, false);
+			} catch (Exception e) {
+				// reported by the assertions below
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+		Assert.assertTrue(inTeardown.await(3, TimeUnit.SECONDS), "Precondition: the teardown must be in flight");
+
+		/*
+		 * A session for the replay's own teardown to find. A reconnect normally has one - connect() tears the
+		 * previous session down before building the next - and without it detachSession() returns null and the close
+		 * this measures never runs.
+		 */
+		FakeMqttClient replaced = new FakeMqttClient();
+		set(tahuClient, "client", replaced);
+
+		try {
+			tahuClient.connect();
+			Assert.assertNull(get(tahuClient, "connectRunnable"),
+					"Precondition: the connect must be refused while the teardown holds the gate");
+
+			long start = System.currentTimeMillis();
+			releaseTeardown.countDown();
+
+			awaitTrue(() -> replaced.disconnectForciblyCalled,
+					"The replayed connect must tear down the session it is replacing");
+			long elapsed = System.currentTimeMillis() - start;
+
+			Assert.assertTrue(replaced.publishedTopics().contains(LWT_TOPIC),
+					"The replayed connect must still publish the LWT for the session it replaces");
+			Assert.assertTrue(elapsed >= 1000, "The replayed connect reached disconnectForcibly in " + elapsed
+					+ "ms, so it skipped the unconditional Paho grace period - it is running interrupted, and the "
+					+ "LWT it just published is cut off before it can reach the server");
+		} finally {
+			releaseTeardown.countDown();
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
+	 * A deferral armed before a shutdown must not connect after it.
+	 *
+	 * HostApplication.shutdown() clears autoReconnect and then disconnects, publishing the retained offline STATE.
+	 * A replay that runs after that resurrects a session the application has finished with, and connectComplete()
+	 * republishes the retained STATE as online for a host that is down - which every edge node bound to that primary
+	 * host ID believes, and none of them fails over.
+	 *
+	 * connect() cannot catch this itself: its only gate is getAutoReconnect() && state.inProgress(), which stops
+	 * testing anything the moment autoReconnect goes false. The check has to be on the replay path.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS * 2)
+	public void aDeferredConnectIsDroppedWhenTheClientStopsAutoReconnecting() throws Exception {
+		wire(8, 8);
+		final CountDownLatch inTeardown = new CountDownLatch(1);
+		final CountDownLatch releaseTeardown = new CountDownLatch(1);
+
+		fakeClient.duringDisconnectForcibly = () -> {
+			inTeardown.countDown();
+			try {
+				releaseTeardown.await(5, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+
+		Thread disconnector = new Thread(() -> {
+			try {
+				tahuClient.disconnect(0, 1, false, false, false);
+			} catch (Exception e) {
+				// reported by the assertions below
+			}
+		}, "disconnector");
+		disconnector.setDaemon(true);
+		disconnector.start();
+		Assert.assertTrue(inTeardown.await(3, TimeUnit.SECONDS), "Precondition: the teardown must be in flight");
+
+		try {
+			tahuClient.connect();
+			Assert.assertTrue((Boolean) get(tahuClient, "deferredConnectPending"),
+					"Precondition: the refused connect must have armed a replay");
+
+			// What shutdown() does, in the window the replay is waiting in
+			tahuClient.setAutoReconnect(false);
+			releaseTeardown.countDown();
+
+			awaitFalse(() -> {
+				try {
+					return (Boolean) get(tahuClient, "deferredConnectPending");
+				} catch (Exception e) {
+					return true;
+				}
+			}, "The armed replay must be resolved once the teardown finishes");
+
+			Thread.sleep(500);
+			Assert.assertNull(get(tahuClient, "connectRunnable"),
+					"A connect ran after the client stopped auto reconnecting - the session the application shut down "
+							+ "is back up, and its BIRTH republishes the retained STATE as online");
+		} finally {
+			releaseTeardown.countDown();
+			tahuClient.setAutoReconnect(true);
+			Object connectRunnable = get(tahuClient, "connectRunnable");
+			if (connectRunnable != null) {
+				invoke(connectRunnable, "stopConnectAttempts");
+			}
+			Thread connectThread = (Thread) get(tahuClient, "connectRunnableThread");
+			if (connectThread != null) {
+				connectThread.interrupt();
+			}
+		}
+	}
+
+	/**
+	 * A teardown must cancel a replay armed for the session it is tearing down.
+	 *
+	 * The deferral records an intent, not a session, so nothing in it distinguishes "reconnect the session that just
+	 * went away" from "reconnect whatever is there when the teardown finishes". Cancelling on teardown is what makes
+	 * the intent scoped: a connect refused moments before a disconnect is a connect for a session that no longer
+	 * exists by the time it could run.
+	 */
+	@Test(
+			timeOut = TIMEOUT_MS)
+	public void aTeardownCancelsAReplayArmedForTheSessionItIsTearingDown() throws Exception {
+		wire(8, 8);
+		Assert.assertNull(get(tahuClient, "connectRunnable"), "Precondition: nothing has connected yet");
+		set(tahuClient, "deferredConnectPending", true);
+
+		tahuClient.disconnect(0, 1, false, false, false);
+
+		/*
+		 * The observable is the connect, not the flag. releaseTeardownClaim() clears the flag on its way past
+		 * whether or not the teardown cancelled it, so asserting the flag alone passes against a teardown that
+		 * cancels nothing - it just watches the replay path consume the intent and then run it.
+		 */
+		Thread.sleep(1500);
+		Assert.assertNull(get(tahuClient, "connectRunnable"),
+				"A replay armed before the teardown connected after it. Nothing ties the intent to the session that "
+						+ "asked for it, so it reconnects whatever is there when the last claim drops");
+		Assert.assertFalse((Boolean) get(tahuClient, "deferredConnectPending"),
+				"The replay must not still be armed once the teardown has finished");
 	}
 
 	/**
@@ -1981,6 +2410,38 @@ public class TahuClientPublishBufferTest {
 		Assert.fail("Buffer depth never reached " + expected + " (currently " + tahuClient.getPublishBufferDepth() + ")");
 	}
 
+	/** Full dump with monitor ownership, plus explicit deadlock detection, for when the stress test wedges. */
+	private static String dumpThreads() {
+		StringBuilder sb = new StringBuilder();
+		ThreadMXBean mx = ManagementFactory.getThreadMXBean();
+
+		long[] deadlocked = mx.findDeadlockedThreads();
+		sb.append("=== deadlocked threads: ").append(deadlocked == null ? "none" : deadlocked.length).append("\n");
+
+		for (ThreadInfo info : mx.dumpAllThreads(true, true)) {
+			String name = info.getThreadName();
+			if (!name.startsWith("stress-") && !name.startsWith("Tahu") && !name.startsWith("test-")
+					&& !name.startsWith("lock-") && !name.startsWith("disconnector")) {
+				continue;
+			}
+			sb.append("\n--- ").append(name).append(" [").append(info.getThreadState()).append("]");
+			if (info.getLockName() != null) {
+				sb.append("\n    waiting on ").append(info.getLockName());
+			}
+			if (info.getLockOwnerName() != null) {
+				sb.append("\n    held by ").append(info.getLockOwnerName());
+			}
+			for (MonitorInfo m : info.getLockedMonitors()) {
+				sb.append("\n    owns ").append(m).append(" at ").append(m.getLockedStackFrame());
+			}
+			StackTraceElement[] st = info.getStackTrace();
+			for (int i = 0; i < Math.min(st.length, 12); i++) {
+				sb.append("\n      at ").append(st[i]);
+			}
+		}
+		return sb.toString();
+	}
+
 	private static void setInProgress(TahuClient client, boolean inProgress) throws Exception {
 		Object state = get(client, "state");
 		Method setter = state.getClass().getDeclaredMethod("setInProgress", boolean.class);
@@ -2006,6 +2467,10 @@ public class TahuClientPublishBufferTest {
 	 * The retry and the teardown moved off the calling thread, so publishBirthMessage() returns before either has
 	 * happened. Asserting immediately after it would test the handoff rather than the outcome.
 	 */
+	private void awaitFalse(BooleanSupplier condition, String message) throws Exception {
+		awaitTrue(() -> !condition.getAsBoolean(), message);
+	}
+
 	private void awaitTrue(BooleanSupplier condition, String message) throws Exception {
 		long deadline = System.currentTimeMillis() + TIMEOUT_MS - 500;
 		while (System.currentTimeMillis() < deadline) {

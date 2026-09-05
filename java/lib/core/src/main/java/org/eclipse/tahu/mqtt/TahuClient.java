@@ -122,16 +122,22 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private static final long LWT_DRAIN_TIMEOUT = 2000;
 
-	/* How long a connect refused during a teardown keeps trying, and how often it looks. */
-	private static final long DEFERRED_CONNECT_TIMEOUT = 30000;
-	private static final long DEFERRED_CONNECT_POLL = 50;
+	/*
+	 * The pre-LWT flush polls on its own interval, not PUBLISH_BUFFER_POLL_INTERVAL, which the drain's retry ladder
+	 * also uses. At 250ms a 600ms no-progress window was really 750ms - the first poll at or past it - so the
+	 * threshold could not mean what it said and the effective budget was 750ms of a nominal 2000ms.
+	 */
+	private static final long DRAIN_WAIT_POLL = 50;
 
 	/*
-	 * How long the pre-LWT flush tolerates seeing no change at all before giving up. The buffer drains in steps -
-	 * a permit returns, depth falls - so an interval with neither moving means nothing is servicing it, whichever
-	 * thread is waiting and whatever lock is in the way.
+	 * How long the flush tolerates seeing no change before giving up, as a fraction of its own budget rather than a
+	 * fixed figure. The buffer drains in steps - a permit returns, depth falls - so an interval with neither moving
+	 * means nothing is servicing it, whichever thread waits and whatever lock is in the way. Half the budget keeps
+	 * it well clear of an acknowledgement round trip on a slow server, which is the case this must not mistake for
+	 * a stalled one, while still recovering the other half when nothing is coming.
 	 */
-	private static final long DRAIN_NO_PROGRESS_TIMEOUT = 600;
+	private static final long DRAIN_NO_PROGRESS_FRACTION = 2;
+	private static final long DRAIN_NO_PROGRESS_FLOOR = 500;
 
 	private Thread connectRunnableThread;
 	private ConnectRunnable connectRunnable;
@@ -188,7 +194,12 @@ public class TahuClient implements MqttCallbackExtended {
 	/*
 	 * Odds/ends
 	 */
-	private boolean autoReconnect;
+	/*
+	 * Volatile because the deferred connect below reads it as a shutting-down signal, and the write comes from an
+	 * application thread holding no lock - HostApplication.shutdown() sets it false and then disconnects. Without
+	 * that edge the guard can read a stale true indefinitely, which is precisely the case it exists to refuse.
+	 */
+	private volatile boolean autoReconnect;
 	private RandomStartupDelay randomStartupDelay;
 
 	/*
@@ -281,8 +292,19 @@ public class TahuClient implements MqttCallbackExtended {
 	 */
 	private Thread birthRecoveryThread;
 
-	/* Replays a connect that arrived while a teardown held the gate. See scheduleDeferredConnect(). */
-	private Thread deferredConnectThread;
+	/*
+	 * A connect refused because a teardown held the gate.
+	 *
+	 * Read and written under clientLock, together with the gate itself. Testing the gate and recording the intent as
+	 * separate steps is the same lost update the flag exists to prevent: a teardown can release between them, find
+	 * nothing pending, and leave the caller having recorded an intent nobody will act on.
+	 *
+	 * The intent is the whole of the state. There is deliberately no handle on the worker that replays it: a worker
+	 * past the gate is running a connect that cannot be cancelled from outside - connect() never tests the interrupt
+	 * flag - so holding a handle only offers the interrupt, which cancels nothing and breaks the timed waits the
+	 * teardown inside that connect depends on.
+	 */
+	private boolean deferredConnectPending;
 	private TahuMqttAsyncClient birthRecoverySession;
 
 	private Date connectTime;
@@ -1128,6 +1150,7 @@ public class TahuClient implements MqttCallbackExtended {
 		logger.info("{}: Waiting up to {}ms for {} buffered publishes to drain before publishing the LWT",
 				getClientId(), timeoutMillis, depth);
 		long deadline = System.currentTimeMillis() + timeoutMillis;
+		long noProgressTimeout = Math.max(DRAIN_NO_PROGRESS_FLOOR, timeoutMillis / DRAIN_NO_PROGRESS_FRACTION);
 		int lastDepth = depth;
 		int lastPermits = getAvailablePublishPermits();
 		long lastProgress = System.currentTimeMillis();
@@ -1164,13 +1187,13 @@ public class TahuClient implements MqttCallbackExtended {
 				lastDepth = currentDepth;
 				lastPermits = currentPermits;
 				lastProgress = System.currentTimeMillis();
-			} else if (System.currentTimeMillis() - lastProgress >= DRAIN_NO_PROGRESS_TIMEOUT) {
+			} else if (System.currentTimeMillis() - lastProgress >= noProgressTimeout) {
 				logger.debug("{}: Stopped waiting for the publish buffer - no progress for {}ms, so nothing is "
-						+ "servicing it", getClientId(), DRAIN_NO_PROGRESS_TIMEOUT);
+						+ "servicing it", getClientId(), noProgressTimeout);
 				return;
 			}
 			try {
-				Thread.sleep(PUBLISH_BUFFER_POLL_INTERVAL);
+				Thread.sleep(DRAIN_WAIT_POLL);
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
 				return;
@@ -1610,17 +1633,6 @@ public class TahuClient implements MqttCallbackExtended {
 		 * which is the ordering the lock used to give; waiting here would put this thread back into the cycle the
 		 * teardown was restructured to break.
 		 */
-		if (isDisconnectInProgress()) {
-			/*
-			 * Deferred rather than dropped. A caller whose only reconnect trigger is one-shot - TahuHostCallback's
-			 * connectionLost is exactly that, and HostApplication has no run loop behind it - would otherwise lose
-			 * its single attempt and never come back.
-			 */
-			logger.debug("{}: Deferring the connect - a disconnect is in progress", getClientId());
-			scheduleDeferredConnect();
-			return;
-		}
-
 		logger.debug("{}: Starting new connect, autoReconnect: {}", getClientId(), autoReconnect);
 
 		/*
@@ -1630,8 +1642,24 @@ public class TahuClient implements MqttCallbackExtended {
 		 * way. See the comment on that method.
 		 */
 		DetachedSession detached = null;
+		boolean claimed = false;
 		synchronized (clientLock) {
 			logger.debug("{}: Got lock for new connect", getClientId());
+
+			/*
+			 * Deferred rather than dropped, and recorded under the same lock the gate is read under. A caller whose
+			 * only reconnect trigger is one-shot - TahuHostCallback's connectionLost is exactly that, and
+			 * HostApplication has no run loop behind it - would otherwise lose its single attempt and never return.
+			 *
+			 * The teardown replays it when its last claim is released, so there is nothing to poll and no deadline
+			 * to expire. A teardown that never finishes leaves the client wedged for reasons no reconnect can fix.
+			 */
+			if (isDisconnectInProgress()) {
+				logger.debug("{}: Deferring the connect - a disconnect is in progress", getClientId());
+				deferredConnectPending = true;
+				return;
+			}
+
 			try {
 				// reset the timers if needed
 				if (getDisconnectTime() == null) {
@@ -1645,7 +1673,21 @@ public class TahuClient implements MqttCallbackExtended {
 				}
 
 				teardownsInFlight.incrementAndGet();
-				detached = detachSession(false, true, true);
+				claimed = true;
+
+				/*
+				 * The LWT still publishes, but this does not wait under clientLock for its delivery confirmation.
+				 * isLwtDeliveryComplete() polls for keepAlive * 4 quarter seconds - keepAlive seconds, 30 by default
+				 * - and the confirmation it waits for arrives on Paho's callback thread, so every other operation on
+				 * this client queues behind a reconnect for that long. BirthRecovery blocking there is one of the
+				 * threads the wait needs.
+				 *
+				 * The death certificate is not sacrificed: closeDetachedSession() pays an unconditional second
+				 * before it touches the socket, with the lock released, which is the same grace period the wait was
+				 * providing. Callers that ask for a graceful disconnect still get the confirmed wait - only this
+				 * pre-connect teardown of a session that is being replaced drops it.
+				 */
+				detached = detachSession(false, true, false);
 
 				/*
 				 * Armed here, under the lock that detached the old session, rather than after the close. detachSession
@@ -1655,8 +1697,16 @@ public class TahuClient implements MqttCallbackExtended {
 				 */
 				state.setInProgress(true);
 			} catch (Throwable t) {
+				/*
+				 * Only if this call actually took a claim. Anything above the increment can throw, and releasing
+				 * then drives the count negative - which the correction in releaseTeardownClaim() resets to zero,
+				 * clearing a claim another teardown is still holding.
+				 */
 				logger.error("{}: Error connecting", getClientId(), t);
-				releaseTeardownClaim();
+				if (claimed) {
+					releaseTeardownClaim();
+					claimed = false;
+				}
 				return;
 			}
 		}
@@ -1666,7 +1716,9 @@ public class TahuClient implements MqttCallbackExtended {
 		} catch (Exception e) {
 			logger.error("{}: Failed to close the previous session - continuing with the connect", getClientId(), e);
 		} finally {
-			releaseTeardownClaim();
+			if (claimed) {
+				releaseTeardownClaim();
+			}
 		}
 
 		synchronized (clientLock) {
@@ -1720,20 +1772,26 @@ public class TahuClient implements MqttCallbackExtended {
 		DetachedSession detached;
 
 		/*
-		 * Outside the try, deliberately. Inside it, this early return would run the finally below and release a claim
-		 * this call never made - clearing another teardown's flag while its client is still open.
+		 * One critical section for the identity check, the claim and the detach. Splitting them let the session
+		 * change between the check and the teardown it authorises, so the check governed nothing. Only the Paho
+		 * close runs with the lock released, because that is the part that can wait on the callback thread.
+		 *
+		 * The claim is tracked rather than inferred from reaching the finally. The early return happens before it is
+		 * taken, so releasing unconditionally would clear a slot this call never claimed - and anything throwing
+		 * between the claim and the close would leak one, wedging the gate shut for the life of the client. Both
+		 * directions have been live defects here; the flag is what makes neither reachable.
 		 */
-		synchronized (clientLock) {
-			if (expected != null && client != expected) {
-				logger.debug("{}: Not disconnecting - the session to tear down is no longer the live one",
-						getClientId());
-				return false;
-			}
-			teardownsInFlight.incrementAndGet();
-		}
-
+		boolean claimed = false;
 		try {
 			synchronized (clientLock) {
+				if (expected != null && client != expected) {
+					logger.debug("{}: Not disconnecting - the session to tear down is no longer the live one",
+							getClientId());
+					return false;
+				}
+
+				teardownsInFlight.incrementAndGet();
+				claimed = true;
 				detached = detachSession(sendDisconnect, publishLwt, waitForLwt);
 
 				// reset the timers if needed
@@ -1746,7 +1804,9 @@ public class TahuClient implements MqttCallbackExtended {
 
 			closeDetachedSession(detached, disconnectQuieseTime, disconnectTimeout);
 		} finally {
-			releaseTeardownClaim();
+			if (claimed) {
+				releaseTeardownClaim();
+			}
 		}
 
 		return detached != null;
@@ -1796,47 +1856,71 @@ public class TahuClient implements MqttCallbackExtended {
 		if (remaining < 0) {
 			logger.error("{}: Teardown claim released more often than it was taken - correcting", getClientId());
 			teardownsInFlight.set(0);
+			remaining = 0;
+		}
+
+		if (remaining == 0) {
+			synchronized (clientLock) {
+				// Re-tested under the lock: another teardown may have claimed while this one was releasing
+				if (!isDisconnectInProgress()) {
+					runPendingConnect();
+				}
+			}
 		}
 	}
 
 	/**
-	 * Replays a connect that was refused because a teardown held the gate.
+	 * Runs a connect that was refused while a teardown held the gate, once the last teardown has finished.
 	 *
-	 * On a worker, and never by waiting in connect() itself: the teardown this waits on ends inside Paho's
-	 * CommsCallback.stop(), which spin waits for the callback thread - so a connect() arriving on that thread and
-	 * waiting inline would be the same two party deadlock the teardown was restructured to break. Bounded, because a
-	 * teardown that never finishes must not leave a thread here for the life of the JVM.
+	 * Called from {@link #releaseTeardownClaim()} with {@link #clientLock} held, so the pending flag is tested and
+	 * cleared in the same critical section that {@link #connect()} sets it in - there is no window in which one
+	 * observes the gate and the other observes the flag.
+	 *
+	 * On a worker rather than inline, for two reasons. The releasing thread can be Paho's callback thread, by way of
+	 * EdgeClient disconnecting from messageArrived, and connect() there would hold clientLock across a Paho close
+	 * inside the callback dispatch. And releaseTeardownClaim() is reached from connect()'s own finally, so running
+	 * connect() inline would recurse through the application callback.
 	 */
-	private void scheduleDeferredConnect() {
-		synchronized (clientLock) {
-			if (deferredConnectThread != null && deferredConnectThread.isAlive()) {
-				logger.debug("{}: A deferred connect is already pending", getClientId());
+	private void runPendingConnect() {
+		if (!deferredConnectPending) {
+			return;
+		}
+
+		/*
+		 * Refused if the client is being shut down. HostApplication.shutdown() clears autoReconnect and then
+		 * disconnects, and a replay after that resurrects a session the application has finished with - republishing
+		 * a retained online STATE for a host that is down, which every edge node bound to it would believe.
+		 */
+		if (!autoReconnect) {
+			logger.debug("{}: Dropping the deferred connect - the client is not auto reconnecting", getClientId());
+			deferredConnectPending = false;
+			return;
+		}
+
+		deferredConnectPending = false;
+
+		/*
+		 * No dedupe against a worker that is already running. Suppressing a replay on the strength of another one
+		 * being alive is how the mechanism this replaced lost connects - the live worker may itself be about to be
+		 * refused, and then nothing is left armed. A replay that turns out to be redundant is refused by connect()'s
+		 * own in-progress gate at the cost of one short lived thread, and the pending flag bounds how many can be
+		 * armed at once.
+		 *
+		 * autoReconnect is re-read on the worker as well as here. Between this arming and the worker reaching the
+		 * gate the application can shut the client down completely, and connect() has no autoReconnect check of its
+		 * own on that path - its gate is getAutoReconnect() && state.inProgress(), which stops testing anything once
+		 * autoReconnect is false. This is the last point at which the replay can still be abandoned.
+		 */
+		Thread worker = new Thread(() -> {
+			if (!autoReconnect) {
+				logger.debug("{}: Dropping the deferred connect - the client stopped auto reconnecting while it was "
+						+ "pending", getClientId());
 				return;
 			}
-
-			deferredConnectThread = new Thread(() -> {
-				long deadline = System.currentTimeMillis() + DEFERRED_CONNECT_TIMEOUT;
-				while (System.currentTimeMillis() < deadline) {
-					if (!isDisconnectInProgress()) {
-						logger.debug("{}: Teardown finished - running the deferred connect", getClientId());
-						connect();
-						return;
-					}
-
-					try {
-						Thread.sleep(DEFERRED_CONNECT_POLL);
-					} catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-						return;
-					}
-				}
-
-				logger.warn("{}: Gave up on the deferred connect - a teardown was still in progress after {}ms",
-						getClientId(), DEFERRED_CONNECT_TIMEOUT);
-			}, "TahuDeferredConnect-" + getClientId().getMqttClientId());
-			deferredConnectThread.setDaemon(true);
-			deferredConnectThread.start();
-		}
+			connect();
+		}, "TahuDeferredConnect-" + getClientId().getMqttClientId());
+		worker.setDaemon(true);
+		worker.start();
 	}
 
 	/**
@@ -1863,6 +1947,22 @@ public class TahuClient implements MqttCallbackExtended {
 		} catch (Exception e) {
 			logger.error("{}: Failed to shut down the connect runnable", getClientId());
 		}
+
+		/*
+		 * A replay armed for a session this is tearing down is not wanted. The intent is cancelled; the worker that
+		 * would run it deliberately is not interrupted.
+		 *
+		 * Interrupting it cancels nothing - connect() never tests the interrupt flag, so a worker past the gate
+		 * connects regardless - and on the replay path the thread it interrupts is this one, because the worker runs
+		 * connect() and connect() calls this method. Everything left in the teardown from that point is a timed
+		 * wait: the pre-LWT drain returns at its first sleep, and closeDetachedSession() skips the unconditional
+		 * second that gives the LWT time to reach the server before the socket goes. connect() gives up waiting for
+		 * the LWT acknowledgement on the strength of that second, so self-interrupting leaves it with no cover.
+		 *
+		 * What actually stops a replay landing after a shutdown is this flag plus the autoReconnect re-check the
+		 * worker makes immediately before it connects.
+		 */
+		deferredConnectPending = false;
 
 		try {
 			if (client == null) {
@@ -2154,10 +2254,18 @@ public class TahuClient implements MqttCallbackExtended {
 				// Create the client instance
 				logger.info("{}: Creating the MQTT Client to {} on thread {}", getClientId(), getMqttServerUrl(),
 						Thread.currentThread().getName());
-				client = new TahuMqttAsyncClient(getMqttServerUrl().toString(), getClientId().toString(), null);
 
-				// Set the callback handler
-				client.setCallback(callback);
+				/*
+				 * Under clientLock, because this was the one write to the field that was not - and a teardown that
+				 * checks the client's identity and then acts on it cannot be made atomic against a writer that
+				 * ignores the lock, however few acquisitions the teardown uses. The callback is set inside the same
+				 * block so no reader can see a client without one. The connect itself stays outside: it is network
+				 * work and must not be done holding this lock.
+				 */
+				synchronized (clientLock) {
+					client = new TahuMqttAsyncClient(getMqttServerUrl().toString(), getClientId().toString(), null);
+					client.setCallback(callback);
+				}
 				IMqttToken connectToken = null;
 
 				// A time stamp to track the current attempt in case the underlying client is stuck attempting forever
